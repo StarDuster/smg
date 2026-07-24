@@ -418,6 +418,9 @@ struct Router {
     decode_urls: Option<Vec<String>>,
     prefill_policy: Option<PolicyType>,
     decode_policy: Option<PolicyType>,
+    prefill_max_concurrent_requests: i32,
+    prefill_queue_size: usize,
+    prefill_queue_timeout_secs: u64,
     max_concurrent_requests: i32,
     cors_allowed_origins: Vec<String>,
     retry_max_retries: u32,
@@ -746,6 +749,9 @@ impl Router {
             .max_concurrent_requests(self.max_concurrent_requests)
             .queue_size(self.queue_size)
             .queue_timeout_secs(self.queue_timeout_secs)
+            .prefill_max_concurrent_requests(self.prefill_max_concurrent_requests)
+            .prefill_queue_size(self.prefill_queue_size)
+            .prefill_queue_timeout_secs(self.prefill_queue_timeout_secs)
             .cors_allowed_origins(self.cors_allowed_origins.clone())
             .retry_config(config::RetryConfig {
                 max_retries: self.retry_max_retries,
@@ -884,6 +890,9 @@ impl Router {
         decode_urls = None,
         prefill_policy = None,
         decode_policy = None,
+        prefill_max_concurrent_requests = -1,
+        prefill_queue_size = 100,
+        prefill_queue_timeout_secs = 60,
         max_concurrent_requests = -1,
         cors_allowed_origins = vec![],
         retry_max_retries = 5,
@@ -1011,6 +1020,9 @@ impl Router {
         decode_urls: Option<Vec<String>>,
         prefill_policy: Option<PolicyType>,
         decode_policy: Option<PolicyType>,
+        prefill_max_concurrent_requests: i32,
+        prefill_queue_size: usize,
+        prefill_queue_timeout_secs: u64,
         max_concurrent_requests: i32,
         cors_allowed_origins: Vec<String>,
         retry_max_retries: u32,
@@ -1154,6 +1166,9 @@ impl Router {
             decode_urls,
             prefill_policy,
             decode_policy,
+            prefill_max_concurrent_requests,
+            prefill_queue_size,
+            prefill_queue_timeout_secs,
             max_concurrent_requests,
             cors_allowed_origins,
             retry_max_retries,

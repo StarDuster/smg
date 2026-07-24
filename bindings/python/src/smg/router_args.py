@@ -53,6 +53,12 @@ class RouterArgs:
     encode_policy: str | None = None  # Specific policy for encode nodes in EPD mode
     prefill_policy: str | None = None  # Specific policy for prefill nodes in PD mode
     decode_policy: str | None = None  # Specific policy for decode nodes in PD mode
+    # Maximum PD requests concurrently occupying the prefill phase (-1 to disable)
+    prefill_max_concurrent_requests: int = -1
+    # Queue size for PD requests waiting for a prefill slot
+    prefill_queue_size: int = 100
+    # Maximum time (in seconds) a PD request can wait for a prefill slot
+    prefill_queue_timeout_secs: int = 60
     worker_startup_timeout_secs: int = 1800
     worker_startup_check_interval: int = 30
     load_monitor_interval: int = 10
@@ -542,6 +548,33 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-max-concurrent-requests",
+            type=int,
+            default=RouterArgs.prefill_max_concurrent_requests,
+            help=(
+                "Maximum PD requests concurrently occupying the prefill phase."
+                " A non-positive value disables the limit (default: -1)."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-size",
+            type=int,
+            default=RouterArgs.prefill_queue_size,
+            help=(
+                "Queue size for PD requests waiting for a prefill slot."
+                " Only used when --prefill-max-concurrent-requests is positive (default: 100)."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-timeout-secs",
+            type=int,
+            default=RouterArgs.prefill_queue_timeout_secs,
+            help=(
+                "Maximum time in seconds a PD request can wait for a prefill slot"
+                " before it is rejected (default: 60)."
+            ),
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",
