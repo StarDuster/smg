@@ -39,17 +39,21 @@ pub(crate) async fn collect_responses(
         ExecutionResult::PrefillDecode {
             mut prefill,
             decode,
+            prefill_guard,
             ..
         } => {
-            // Collect prefill for input_logprobs (don't mark completed yet)
+            // Collect prefill for input_logprobs (don't mark completed yet),
+            // then release the admission slot: the prefill phase is over.
             let prefill_responses = collect_stream_responses(&mut prefill, "Prefill").await?;
+            drop(prefill_guard);
 
             // Collect decode for actual output (don't mark completed yet)
             let mut decode_stream = *decode;
             let mut decode_responses =
                 collect_stream_responses(&mut decode_stream, "Decode").await?;
 
-            // Mark both streams as completed now that both succeeded
+            // Mark both streams as completed now that both succeeded, so a
+            // decode failure still aborts the prefill leg on drop.
             prefill.mark_completed();
             decode_stream.mark_completed();
 

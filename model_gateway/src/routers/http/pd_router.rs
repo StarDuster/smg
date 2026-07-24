@@ -43,7 +43,10 @@ use crate::{
         grpc::utils::{error_type_from_status, route_to_endpoint},
         RouterTrait,
     },
-    worker::{HashRing, Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID},
+    worker::{
+        HashRing, PrefillAdmission, PrefillAdmissionRejection, PrefillPermit, PrefillPhaseGuard,
+        Worker, WorkerLoadGuard, WorkerRegistry, WorkerType, UNKNOWN_MODEL_ID,
+    },
 };
 
 #[derive(Debug)]
@@ -53,6 +56,7 @@ pub struct PDRouter {
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    pub prefill_admission: Option<Arc<PrefillAdmission>>,
 }
 
 #[derive(Clone)]
@@ -169,7 +173,35 @@ impl PDRouter {
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            prefill_admission: ctx.prefill_admission.clone(),
         })
+    }
+
+    async fn acquire_prefill_permit(&self) -> Result<Option<PrefillPermit>, Response> {
+        let Some(admission) = &self.prefill_admission else {
+            return Ok(None);
+        };
+
+        admission
+            .admit()
+            .await
+            .map(Some)
+            .map_err(|reason| match reason {
+                PrefillAdmissionRejection::QueueFull => error::create_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "pd_prefill_queue_full",
+                    "prefill admission queue is full",
+                ),
+                PrefillAdmissionRejection::QueueTimeout => error::create_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "pd_prefill_queue_timeout",
+                    "timed out waiting for a prefill admission slot",
+                ),
+                PrefillAdmissionRejection::Closed => error::service_unavailable(
+                    "pd_prefill_admission_closed",
+                    "prefill admission is unavailable",
+                ),
+            })
     }
 
     fn handle_server_selection_error(error: String) -> Response {
@@ -321,6 +353,11 @@ impl PDRouter {
                     let shared_request = Arc::clone(&shared_request);
                     let context = context.clone();
                     async move {
+                        let prefill_permit = match self.acquire_prefill_permit().await {
+                            Ok(permit) => permit,
+                            Err(response) => return response,
+                        };
+
                         let (prefill, decode) = match self
                             .select_pd_pair(
                                 context.request_text.as_deref(),
@@ -425,6 +462,7 @@ impl PDRouter {
                                 context,
                                 Arc::clone(&prefill),
                                 Arc::clone(&decode),
+                                prefill_permit,
                             )
                             .await;
 
@@ -604,6 +642,7 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[expect(clippy::too_many_arguments)]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -612,11 +651,18 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        prefill_permit: Option<PrefillPermit>,
     ) -> Response {
-        let load_guards = vec![
-            WorkerLoadGuard::new(prefill.clone(), headers),
-            WorkerLoadGuard::new(decode.clone(), headers),
-        ];
+        // With admission enabled, prefill load + permit live in a phase guard
+        // released when the prefill leg completes. With admission disabled,
+        // prefill load joins `load_guards` for the full request (legacy behavior).
+        let prefill_guard =
+            prefill_permit.map(|permit| PrefillPhaseGuard::new(prefill.clone(), headers, permit));
+        let mut load_guards = Vec::with_capacity(2);
+        if prefill_guard.is_none() {
+            load_guards.push(WorkerLoadGuard::new(prefill.clone(), headers));
+        }
+        load_guards.push(WorkerLoadGuard::new(decode.clone(), headers));
 
         let mut headers_with_trace = headers.cloned().unwrap_or_default();
         inject_trace_context_http(&mut headers_with_trace);
@@ -697,6 +743,7 @@ impl PDRouter {
                 status
             );
 
+            drop(prefill_guard);
             return self
                 .handle_decode_error_response(decode_response, &context, decode, load_guards)
                 .await;
@@ -731,6 +778,7 @@ impl PDRouter {
             runtime,
             prefill_head_elapsed + prefill_drain_start.elapsed(),
         );
+        drop(prefill_guard);
 
         if context.is_stream {
             // Streaming response
@@ -1548,6 +1596,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            prefill_admission: None,
         }
     }
 
