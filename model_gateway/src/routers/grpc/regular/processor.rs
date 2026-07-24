@@ -163,7 +163,7 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     original_request.tool_choice.as_ref(),
-                    &original_request.model,
+                    parser_model_id,
                     history_tool_calls_count,
                 );
             } else if tool_parser_available {
@@ -171,7 +171,6 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         parser_model_id,
-                        &original_request.model,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
                     )
@@ -312,11 +311,13 @@ impl ResponseProcessor {
     }
 
     /// Parse tool calls using model-specific parser
+    ///
+    /// `parser_model_id` is the canonical model ID. It selects both the parser
+    /// and the tool call ID format, which must stay in step.
     pub async fn parse_tool_calls(
         &self,
         processed_text: &str,
         parser_model_id: &str,
-        requested_model_id: &str,
         tools: &[Tool],
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
@@ -350,7 +351,7 @@ impl ResponseProcessor {
                     .map(|(index, tc)| {
                         // Generate ID for this tool call
                         let id = utils::generate_tool_call_id(
-                            requested_model_id,
+                            parser_model_id,
                             &tc.function.name,
                             index,
                             history_tool_calls_count,
@@ -666,7 +667,7 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = utils::parse_json_schema_response(
                     &processed_text,
                     chat_tool_choice.as_ref(),
-                    &messages_request.model,
+                    parser_model_id,
                     utils::message_utils::get_history_tool_calls_count_messages(&messages_request),
                 );
             } else if tool_parser_available {
@@ -679,7 +680,6 @@ impl ResponseProcessor {
                     .parse_tool_calls(
                         &processed_text,
                         parser_model_id,
-                        &messages_request.model,
                         &chat_tools,
                         utils::message_utils::get_history_tool_calls_count_messages(
                             &messages_request,

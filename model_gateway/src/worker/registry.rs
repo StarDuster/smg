@@ -1413,25 +1413,57 @@ impl WorkerRegistry {
     }
 
     fn remove_model_alias_if_unused(&self, alias: &str, canonical_id: &str) {
-        let Entry::Occupied(entry) = self.model_alias_index.entry(alias.to_string()) else {
+        let Entry::Occupied(mut entry) = self.model_alias_index.entry(alias.to_string()) else {
             return;
         };
         if entry.get().as_ref() != canonical_id {
             return;
         }
 
-        let still_declared = self.model_index.get(canonical_id).is_some_and(|workers| {
-            workers.iter().any(|worker| {
-                worker.models().into_iter().any(|model| {
-                    model.id == canonical_id
-                        && model.aliases.iter().any(|candidate| candidate == alias)
-                })
-            })
-        });
-
-        if !still_declared {
-            entry.remove();
+        if self
+            .model_index
+            .get(canonical_id)
+            .is_some_and(|workers| Self::workers_declare_alias(&workers, canonical_id, alias))
+        {
+            return;
         }
+
+        // `canonical_id` no longer advertises the alias. Another model may have
+        // lost the earlier conflict in `add_model_alias` and still declare it,
+        // so hand the alias over instead of dropping it. Dropping it would leave
+        // that model reachable only by its canonical ID.
+        match self.find_model_declaring_alias(alias, canonical_id) {
+            Some(successor) => {
+                entry.insert(successor);
+            }
+            None => {
+                entry.remove();
+            }
+        }
+    }
+
+    /// Whether any worker in `workers` advertises `alias` for `canonical_id`.
+    fn workers_declare_alias(workers: &[Arc<dyn Worker>], canonical_id: &str, alias: &str) -> bool {
+        workers.iter().any(|worker| {
+            worker.models().into_iter().any(|model| {
+                model.id == canonical_id && model.aliases.iter().any(|candidate| candidate == alias)
+            })
+        })
+    }
+
+    /// Find a registered model other than `exclude_canonical_id` that declares
+    /// `alias`. Used to keep an alias resolvable after its current owner leaves.
+    fn find_model_declaring_alias(
+        &self,
+        alias: &str,
+        exclude_canonical_id: &str,
+    ) -> Option<Arc<str>> {
+        self.model_index.iter().find_map(|entry| {
+            let candidate = entry.key();
+            (candidate != exclude_canonical_id
+                && Self::workers_declare_alias(entry.value(), candidate, alias))
+            .then(|| Arc::from(candidate.as_str()))
+        })
     }
 
     /// Shared backend for [`Self::transition_status`] and
@@ -2558,6 +2590,39 @@ mod tests {
 
         registry.remove(&first_id).unwrap();
         assert!(registry.get_by_model("shared").is_empty());
+    }
+
+    #[test]
+    fn test_model_alias_conflict_falls_back_to_remaining_declaring_model() {
+        let registry = WorkerRegistry::new();
+        let first = worker_with_model_aliases(
+            "http://first:8080",
+            "model-a",
+            &["shared"],
+            WorkerType::Regular,
+        );
+        let second = worker_with_model_aliases(
+            "http://second:8080",
+            "model-b",
+            &["shared"],
+            WorkerType::Regular,
+        );
+        let first_id = registry.register(first).unwrap();
+        registry.register(second).unwrap();
+
+        // `model-a` won the alias. Removing it must hand `shared` over to
+        // `model-b`, which still declares it, instead of dropping the alias.
+        registry.remove(&first_id).unwrap();
+
+        assert_eq!(
+            registry.resolve_model_alias("shared").as_deref(),
+            Some("model-b")
+        );
+        assert!(registry.contains_model("shared"));
+        let remaining = registry.get_by_model("shared");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].url(), "http://second:8080");
+        assert!(registry.get_hash_ring("shared").is_some());
     }
 
     #[test]

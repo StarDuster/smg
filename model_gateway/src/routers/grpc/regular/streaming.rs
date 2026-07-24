@@ -484,6 +484,7 @@ impl StreamingProcessor {
                                     tool_choice.as_ref(),
                                     request_id,
                                     model,
+                                    parser_model_id,
                                     created,
                                     system_fingerprint,
                                     history_tool_calls_count,
@@ -1301,6 +1302,7 @@ impl StreamingProcessor {
         tool_choice: Option<&ToolChoice>,
         request_id: &str,
         model: &str,
+        parser_model_id: &str,
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
@@ -1315,7 +1317,7 @@ impl StreamingProcessor {
                 has_tool_calls.insert(index, true);
 
                 let tool_call_id = utils::generate_tool_call_id(
-                    model,
+                    parser_model_id,
                     &function.name,
                     0,
                     history_tool_calls_count,
@@ -1406,7 +1408,7 @@ impl StreamingProcessor {
 
                         let tool_call_id = if let Some(ref name) = tool_call_item.name {
                             Some(utils::generate_tool_call_id(
-                                model,
+                                parser_model_id,
                                 name,
                                 tool_call_item.tool_index,
                                 history_tool_calls_count,
@@ -1962,7 +1964,7 @@ impl StreamingProcessor {
                                     _ => String::new(),
                                 };
                                 let tool_call_id = utils::generate_tool_call_id(
-                                    model,
+                                    parser_model_id,
                                     &tool_name,
                                     0,
                                     history_tool_calls_count,
@@ -2056,7 +2058,7 @@ impl StreamingProcessor {
                                             }
 
                                             let tool_call_id = utils::generate_tool_call_id(
-                                                model,
+                                                parser_model_id,
                                                 name,
                                                 tool_call_item.tool_index,
                                                 history_tool_calls_count,
@@ -2194,7 +2196,7 @@ impl StreamingProcessor {
                         }
 
                         let tool_call_id = utils::generate_tool_call_id(
-                            model,
+                            parser_model_id,
                             name,
                             tool_call_item.tool_index,
                             history_tool_calls_count,

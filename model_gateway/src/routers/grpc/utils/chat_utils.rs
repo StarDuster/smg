@@ -587,10 +587,13 @@ pub fn create_stop_decoder(
 }
 
 /// Parse tool calls from JSON schema constrained response
+///
+/// `parser_model_id` must be the canonical model ID, because the tool call ID
+/// format is model specific and has to match the parser used on the next turn.
 pub(crate) fn parse_json_schema_response(
     processed_text: &str,
     tool_choice: Option<&ToolChoice>,
-    model: &str,
+    parser_model_id: &str,
     history_tool_calls_count: usize,
 ) -> (Option<Vec<ToolCall>>, String) {
     match tool_choice {
@@ -600,7 +603,7 @@ pub(crate) fn parse_json_schema_response(
                 Ok(params) => {
                     let tool_call = ToolCall {
                         id: generate_tool_call_id(
-                            model,
+                            parser_model_id,
                             &function.name,
                             0,
                             history_tool_calls_count,
@@ -636,7 +639,7 @@ pub(crate) fn parse_json_schema_response(
 
                             Some(ToolCall {
                                 id: generate_tool_call_id(
-                                    model,
+                                    parser_model_id,
                                     &name,
                                     i,
                                     history_tool_calls_count,
@@ -683,7 +686,9 @@ pub(crate) fn get_history_tool_calls_count(request: &ChatCompletionRequest) -> u
 /// Generate a tool call ID based on model format
 ///
 /// # Arguments
-/// * `model` - Model name to determine ID format
+/// * `model` - Canonical model ID that decides the ID format. Do not pass a
+///   model alias here: the tool parser is selected by the canonical ID, so an
+///   alias can pick the wrong format and break the next turn.
 /// * `tool_name` - Name of the tool being called
 /// * `tool_index` - Index of this tool call within the current message
 /// * `history_count` - Number of tool calls in previous messages
