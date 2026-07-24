@@ -27,10 +27,10 @@ use crate::routers::{
 /// tokenizes, and builds tool constraints.
 pub(crate) struct MessagePreparationStage;
 
-fn invalid_multimodal_request(error: impl Display) -> Response {
+fn invalid_multimodal_request(model_id: &str, error: impl Display) -> Response {
     error::bad_request(
         "invalid_multimodal_request",
-        format!("Invalid multimodal request: {error}"),
+        format!("Invalid multimodal request for model {model_id}: {error}"),
     )
 }
 
@@ -86,15 +86,16 @@ impl MessagePreparationStage {
         // Resolve media-part ordering from the model registry so /v1/messages
         // renders each model consistently with /v1/chat/completions.
         let model_id = ctx.input.model_id.as_str();
+        let lookup_model_id = ctx.canonical_model_id();
         let tokenizer_entry = ctx
             .components
             .tokenizer_registry
-            .get_by_name(model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
+            .get_by_name(lookup_model_id)
+            .or_else(|| ctx.components.tokenizer_registry.get_by_id(lookup_model_id));
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
                 multimodal::resolve_media_part_order(
-                    model_id,
+                    lookup_model_id,
                     &*tokenizer,
                     mm_components,
                     &entry.id,
@@ -110,7 +111,6 @@ impl MessagePreparationStage {
         let (placeholder_tokens, mm_context) = if media_plan.is_empty() {
             (None, None)
         } else if let Some(mm_components) = ctx.components.multimodal.as_ref() {
-            let model_id = ctx.input.model_id.as_str();
             let (tokenizer_id, tokenizer_source) = match tokenizer_entry {
                 Some(e) => (e.id, e.source),
                 None => {
@@ -128,7 +128,7 @@ impl MessagePreparationStage {
 
             let placeholders = multimodal::prepare_placeholder_tokens(
                 &media_plan,
-                model_id,
+                lookup_model_id,
                 &*tokenizer,
                 mm_components,
                 &tokenizer_id,
@@ -142,14 +142,14 @@ impl MessagePreparationStage {
                     error = %e,
                     "Failed to resolve multimodal placeholder token"
                 );
-                invalid_multimodal_request(e)
+                invalid_multimodal_request(model_id, e)
             })?;
 
             (
                 Some(placeholders),
                 Some((
                     mm_components,
-                    model_id,
+                    lookup_model_id,
                     tokenizer_id,
                     tokenizer_source,
                     media_plan,
@@ -222,12 +222,12 @@ impl MessagePreparationStage {
 
         // Step 4: Multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
+        if let Some((mm_components, lookup_model_id, tokenizer_id, tokenizer_source, media_plan)) =
             mm_context
         {
             match multimodal::process_multimodal_plan(
                 media_plan,
-                model_id,
+                lookup_model_id,
                 &*tokenizer,
                 token_ids,
                 mm_components,
@@ -253,7 +253,7 @@ impl MessagePreparationStage {
                     );
                     return Err(error::bad_request(
                         "multimodal_processing_failed",
-                        format!("Multimodal processing failed: {e}"),
+                        format!("Multimodal processing failed for model {model_id}: {e}"),
                     ));
                 }
             }
@@ -291,7 +291,7 @@ impl MessagePreparationStage {
         let preserve_reasoning_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &ctx.components.reasoning_parser_factory,
             ctx.components.configured_reasoning_parser.as_deref(),
-            &request.model,
+            lookup_model_id,
         );
 
         // Derive skip_special_tokens from parser and constraint type:
@@ -342,14 +342,18 @@ impl MessagePreparationStage {
 
 #[cfg(test)]
 mod tests {
-    use axum::http::StatusCode;
+    use axum::{body::to_bytes, http::StatusCode};
 
     use super::invalid_multimodal_request;
 
-    #[test]
-    fn invalid_multimodal_input_maps_to_bad_request() {
-        let response = invalid_multimodal_request("unsupported audio modality");
+    #[tokio::test]
+    async fn invalid_multimodal_input_preserves_model_and_reason() {
+        let response = invalid_multimodal_request("model-alias", "unsupported audio modality");
 
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let body = String::from_utf8(body.to_vec()).unwrap();
+        assert!(body.contains("model-alias"));
+        assert!(body.contains("unsupported audio modality"));
     }
 }

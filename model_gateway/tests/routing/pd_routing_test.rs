@@ -3,9 +3,14 @@
 //! Tests for prefill-decode disaggregation routing mode.
 
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::Request,
     http::{header::CONTENT_TYPE, StatusCode},
+};
+use openai_protocol::{
+    model_card::ModelCard,
+    models::ListModelsResponse,
+    worker::{WorkerInfo, WorkerSpec, WorkerStatus, WorkerType as ProtocolWorkerType},
 };
 use serde_json::json;
 use smg::config::RouterConfig;
@@ -19,6 +24,67 @@ use crate::common::{
 #[cfg(test)]
 mod pd_routing_tests {
     use super::*;
+
+    const CANONICAL_MODEL: &str = "GLM-5.2";
+    const MODEL_ALIAS: &str = "GLM-5.2-Coding";
+
+    fn worker_spec(url: &str, worker_type: ProtocolWorkerType) -> WorkerSpec {
+        let mut spec = WorkerSpec::new(url);
+        spec.models = vec![ModelCard::new(CANONICAL_MODEL).with_alias(MODEL_ALIAS)].into();
+        spec.worker_type = worker_type;
+        spec.health.disable_health_check = Some(true);
+        spec
+    }
+
+    async fn put_worker(app: &axum::Router, worker_id: &str, spec: &WorkerSpec) {
+        let req = Request::builder()
+            .method("PUT")
+            .uri(format!("/workers/{worker_id}"))
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(spec).unwrap()))
+            .unwrap();
+
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::ACCEPTED,
+            "PUT /workers/{{id}} should enqueue the full worker replacement"
+        );
+    }
+
+    async fn get_worker(app: &axum::Router, worker_id: &str) -> WorkerInfo {
+        let req = Request::builder()
+            .method("GET")
+            .uri(format!("/workers/{worker_id}"))
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(req).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    async fn wait_for_worker_alias(app: &axum::Router, worker_id: &str) {
+        let deadline = tokio::time::Instant::now() + tokio::time::Duration::from_secs(10);
+
+        loop {
+            let info = get_worker(app, worker_id).await;
+            let has_alias = info
+                .spec
+                .models
+                .find(CANONICAL_MODEL)
+                .is_some_and(|card| card.aliases.iter().any(|alias| alias == MODEL_ALIAS));
+            if info.status == Some(WorkerStatus::Ready) && has_alias {
+                return;
+            }
+
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "worker {worker_id} did not become Ready with alias {MODEL_ALIAS}; last response: {info:?}"
+            );
+            tokio::time::sleep(tokio::time::Duration::from_millis(50)).await;
+        }
+    }
 
     /// Test basic PD mode routing with prefill and decode workers
     #[tokio::test]
@@ -147,6 +213,145 @@ mod pd_routing_tests {
             success_count, 20,
             "All requests should succeed in PD mode with round robin"
         );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_pd_model_alias_via_worker_put() {
+        let prefill_url = "http://127.0.0.1:19840".to_string();
+        let decode_url = "http://127.0.0.1:19841".to_string();
+
+        let mut config = RouterConfig::builder()
+            .prefill_decode_mode(vec![(prefill_url.clone(), None)], vec![decode_url.clone()])
+            .round_robin_policy()
+            .host("127.0.0.1")
+            .port(3804)
+            .max_payload_size(256 * 1024 * 1024)
+            .request_timeout_secs(600)
+            .worker_startup_timeout_secs(5)
+            .worker_startup_check_interval_secs(1)
+            .max_concurrent_requests(64)
+            .queue_timeout_secs(60)
+            .build_unchecked();
+        config.health_check.disable_health_check = true;
+
+        let ctx = AppTestContext::new_with_config(
+            config,
+            vec![
+                TestWorkerConfig::prefill(19840),
+                TestWorkerConfig::decode(19841),
+            ],
+        )
+        .await;
+        let app = ctx.create_app();
+
+        let prefill_id = ctx
+            .app_context
+            .worker_registry
+            .get_id_by_url(&prefill_url)
+            .unwrap();
+        let decode_id = ctx
+            .app_context
+            .worker_registry
+            .get_id_by_url(&decode_url)
+            .unwrap();
+
+        let prefill_before = get_worker(&app, prefill_id.as_str()).await;
+        let decode_before = get_worker(&app, decode_id.as_str()).await;
+        assert_eq!(prefill_before.status, Some(WorkerStatus::Ready));
+        assert_eq!(decode_before.status, Some(WorkerStatus::Ready));
+        assert!(prefill_before.spec.models.find(MODEL_ALIAS).is_none());
+        assert!(decode_before.spec.models.find(MODEL_ALIAS).is_none());
+
+        put_worker(
+            &app,
+            prefill_id.as_str(),
+            &worker_spec(&prefill_url, ProtocolWorkerType::Prefill),
+        )
+        .await;
+        put_worker(
+            &app,
+            decode_id.as_str(),
+            &worker_spec(&decode_url, ProtocolWorkerType::Decode),
+        )
+        .await;
+
+        wait_for_worker_alias(&app, prefill_id.as_str()).await;
+        wait_for_worker_alias(&app, decode_id.as_str()).await;
+
+        let mut conflicting_spec = worker_spec(&prefill_url, ProtocolWorkerType::Prefill);
+        conflicting_spec.models =
+            vec![ModelCard::new("replacement-model").with_alias("replacement-alias")].into();
+        let duplicate_post = Request::builder()
+            .method("POST")
+            .uri("/workers")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(serde_json::to_vec(&conflicting_spec).unwrap()))
+            .unwrap();
+        let duplicate_response = app.clone().oneshot(duplicate_post).await.unwrap();
+        assert_eq!(duplicate_response.status(), StatusCode::CONFLICT);
+
+        let prefill_after_conflict = get_worker(&app, prefill_id.as_str()).await;
+        assert!(prefill_after_conflict
+            .spec
+            .models
+            .find(CANONICAL_MODEL)
+            .is_some());
+        assert!(prefill_after_conflict
+            .spec
+            .models
+            .find("replacement-model")
+            .is_none());
+
+        let alias_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": MODEL_ALIAS,
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": false
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let alias_response = app.clone().oneshot(alias_request).await.unwrap();
+        assert_eq!(alias_response.status(), StatusCode::OK);
+
+        let unknown_request = Request::builder()
+            .method("POST")
+            .uri("/v1/chat/completions")
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                json!({
+                    "model": "GLM-5.2-Unknown",
+                    "messages": [{"role": "user", "content": "Hello"}],
+                    "stream": false
+                })
+                .to_string(),
+            ))
+            .unwrap();
+        let unknown_response = app.clone().oneshot(unknown_request).await.unwrap();
+        assert!(
+            !unknown_response.status().is_success(),
+            "an unknown model must not be routed"
+        );
+
+        let models_request = Request::builder()
+            .method("GET")
+            .uri("/v1/models")
+            .body(Body::empty())
+            .unwrap();
+        let models_response = app.clone().oneshot(models_request).await.unwrap();
+        assert_eq!(models_response.status(), StatusCode::OK);
+        let models_body = to_bytes(models_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let models: ListModelsResponse = serde_json::from_slice(&models_body).unwrap();
+        assert_eq!(models.data.len(), 1);
+        assert_eq!(models.data[0].id, CANONICAL_MODEL);
 
         ctx.shutdown().await;
     }

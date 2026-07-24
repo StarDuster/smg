@@ -30,7 +30,7 @@ use crate::{
         event::WorkerEvent,
         hash_ring::HashRing,
         worker::{RuntimeType, WorkerType},
-        ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL,
+        ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -84,6 +84,9 @@ pub struct WorkerDescriptor {
 /// Updates create new snapshots (copy-on-write semantics).
 type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
 
+/// Model alias to canonical model ID.
+type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
@@ -93,6 +96,10 @@ pub struct WorkerRegistry {
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
     model_index: ModelIndex,
+
+    /// Alias index kept separate from `model_index` so aliases do not appear as
+    /// models in discovery or statistics.
+    model_alias_index: ModelAliasIndex,
 
     /// Consistent hash rings per model for O(log n) routing.
     /// Rebuilt on worker add/remove (copy-on-write).
@@ -139,6 +146,7 @@ impl WorkerRegistry {
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
+            model_alias_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
@@ -263,13 +271,19 @@ impl WorkerRegistry {
             .find_map(|entry| (entry.value() == worker_id).then(|| entry.key().clone()))
     }
 
-    /// Get the consistent hash ring for a model (O(1) lookup).
+    /// Get the consistent hash ring for a canonical model or alias.
     ///
     /// Returns `Some(ring)` if any workers are registered for this model,
     /// `None` otherwise. The ring is pre-built and updated on worker add
     /// or remove, so reads are allocation-free apart from the Arc clone.
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
-        self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
+        if self.model_index.contains_key(model_id) {
+            return self.hash_rings.get(model_id).map(|ring| Arc::clone(&ring));
+        }
+        let canonical_id = self.model_alias_index.get(model_id)?;
+        self.hash_rings
+            .get(canonical_id.as_ref())
+            .map(|ring| Arc::clone(&ring))
     }
 
     // ───────────────────────────────────────────────────────────────────
@@ -279,17 +293,54 @@ impl WorkerRegistry {
     /// Empty worker slice constant returned when a lookup has no matches.
     const EMPTY_WORKERS: &'static [Arc<dyn Worker>] = &[];
 
-    /// Return all workers serving a model as an immutable shared slice.
+    /// Return all workers serving a canonical model or alias.
     ///
     /// This is the fastest possible read path: the model index already
     /// stores the slice as an `Arc<[_]>`, so the return value is just an
     /// atomic refcount bump with zero contention. Returns an empty shared
     /// slice when the model is unknown.
     pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
-        self.model_index
+        if let Some(workers) = self.model_index.get(model_id) {
+            return Arc::clone(&workers);
+        }
+        self.model_alias_index
             .get(model_id)
-            .map(|workers| Arc::clone(&workers))
+            .and_then(|canonical_id| {
+                self.model_index
+                    .get(canonical_id.as_ref())
+                    .map(|workers| Arc::clone(&workers))
+            })
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
+    }
+
+    /// Resolve an alias to its canonical model ID without copying the string.
+    ///
+    /// Returns `None` for canonical model IDs, the `unknown` wildcard, and
+    /// unknown names. Callers can use the original input when this returns
+    /// `None`.
+    pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
+        if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
+            return None;
+        }
+
+        let canonical_id = self.model_alias_index.get(model_id)?;
+        self.model_index
+            .contains_key(canonical_id.as_ref())
+            .then(|| Arc::clone(&canonical_id))
+    }
+
+    /// Return whether a canonical model or alias has workers.
+    pub fn contains_model(&self, model_id: &str) -> bool {
+        if self.model_index.contains_key(model_id) {
+            return true;
+        }
+        if model_id == UNKNOWN_MODEL_ID {
+            return false;
+        }
+
+        self.model_alias_index
+            .get(model_id)
+            .is_some_and(|canonical_id| self.model_index.contains_key(canonical_id.as_ref()))
     }
 
     /// Return all workers of a given type as an immutable shared slice.
@@ -581,8 +632,15 @@ impl WorkerRegistry {
     /// override. When retries are disabled for the group, the stored
     /// `max_retries` is always 1.
     pub fn get_retry_config(&self, model_id: &str) -> Option<RetryConfig> {
+        if let Some(config) = self.model_retry_configs.get(model_id) {
+            return Some(config.value().clone());
+        }
+        if self.model_index.contains_key(model_id) {
+            return None;
+        }
+        let canonical_id = self.model_alias_index.get(model_id)?;
         self.model_retry_configs
-            .get(model_id)
+            .get(canonical_id.as_ref())
             .map(|entry| entry.value().clone())
     }
 
@@ -707,6 +765,8 @@ impl WorkerRegistry {
 
         let old_models: HashSet<String> = Self::worker_model_ids(&old_worker).into_iter().collect();
         let new_models: HashSet<String> = Self::worker_model_ids(&new_worker).into_iter().collect();
+        let old_aliases = Self::worker_alias_pairs(&old_worker);
+        let new_aliases = Self::worker_alias_pairs(&new_worker);
 
         // URL changes are not supported via replace — use remove + register instead
         if old_worker.url() != new_worker.url() {
@@ -752,6 +812,23 @@ impl WorkerRegistry {
         for kept_model in old_models.intersection(&new_models) {
             self.add_worker_to_model_index(kept_model, new_worker.clone());
             self.rebuild_hash_ring(kept_model);
+        }
+
+        // Update aliases after canonical indexes so alias removal can inspect
+        // the final worker set for each canonical model.
+        for (alias, canonical_id) in &old_aliases {
+            if !new_aliases.iter().any(|(new_alias, new_canonical_id)| {
+                new_alias == alias && new_canonical_id == canonical_id
+            }) {
+                self.remove_model_alias_if_unused(alias, canonical_id);
+            }
+        }
+        for (alias, canonical_id) in &new_aliases {
+            if !old_aliases.iter().any(|(old_alias, old_canonical_id)| {
+                old_alias == alias && old_canonical_id == canonical_id
+            }) {
+                self.add_model_alias(alias, canonical_id);
+            }
         }
 
         self.warn_on_sampling_defaults_divergence_for_worker(&new_worker);
@@ -983,6 +1060,9 @@ impl WorkerRegistry {
                     self.model_retry_configs.remove(&model_id);
                 }
             }
+            for (alias, canonical_id) in Self::worker_alias_pairs(&worker) {
+                self.remove_model_alias_if_unused(&alias, &canonical_id);
+            }
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
                 type_workers.retain(|id| id != worker_id);
             }
@@ -1086,6 +1166,26 @@ impl WorkerRegistry {
         }
 
         model_ids
+    }
+
+    /// Collect each distinct `(alias, canonical model ID)` advertised by a worker.
+    fn worker_alias_pairs(worker: &Arc<dyn Worker>) -> Vec<(String, String)> {
+        let mut aliases = Vec::new();
+
+        for model in worker.models() {
+            let canonical_id = model.id;
+            for alias in model.aliases {
+                if alias != canonical_id
+                    && !aliases.iter().any(|(existing_alias, existing_canonical)| {
+                        existing_alias == &alias && existing_canonical == &canonical_id
+                    })
+                {
+                    aliases.push((alias, canonical_id.clone()));
+                }
+            }
+        }
+
+        aliases
     }
 
     fn sampling_defaults_label(worker: &Arc<dyn Worker>) -> Option<&str> {
@@ -1204,6 +1304,9 @@ impl WorkerRegistry {
             self.add_worker_to_model_index(&model_id, worker.clone());
             self.rebuild_hash_ring(&model_id);
         }
+        for (alias, canonical_id) in Self::worker_alias_pairs(&worker) {
+            self.add_model_alias(&alias, &canonical_id);
+        }
         self.warn_on_sampling_defaults_divergence_for_worker(&worker);
 
         // Update type index (clone needed for DashMap key ownership)
@@ -1283,6 +1386,52 @@ impl WorkerRegistry {
         }
 
         self.rebuild_hash_ring(model_id);
+    }
+
+    fn add_model_alias(&self, alias: &str, canonical_id: &str) {
+        if alias == UNKNOWN_MODEL_ID {
+            tracing::warn!(
+                alias,
+                canonical_id,
+                "Ignoring model alias reserved for wildcard routing"
+            );
+            return;
+        }
+
+        match self.model_alias_index.entry(alias.to_string()) {
+            Entry::Occupied(entry) if entry.get().as_ref() != canonical_id => tracing::warn!(
+                alias,
+                existing_canonical_id = entry.get().as_ref(),
+                ignored_canonical_id = canonical_id,
+                "Model alias already maps to a different canonical model"
+            ),
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::from(canonical_id));
+            }
+        }
+    }
+
+    fn remove_model_alias_if_unused(&self, alias: &str, canonical_id: &str) {
+        let Entry::Occupied(entry) = self.model_alias_index.entry(alias.to_string()) else {
+            return;
+        };
+        if entry.get().as_ref() != canonical_id {
+            return;
+        }
+
+        let still_declared = self.model_index.get(canonical_id).is_some_and(|workers| {
+            workers.iter().any(|worker| {
+                worker.models().into_iter().any(|model| {
+                    model.id == canonical_id
+                        && model.aliases.iter().any(|candidate| candidate == alias)
+                })
+            })
+        });
+
+        if !still_declared {
+            entry.remove();
+        }
     }
 
     /// Shared backend for [`Self::transition_status`] and
@@ -1524,6 +1673,21 @@ mod tests {
         }
 
         Arc::new(builder.build())
+    }
+
+    fn worker_with_model_aliases(
+        url: &str,
+        canonical_id: &str,
+        aliases: &[&str],
+        worker_type: WorkerType,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(canonical_id).with_aliases(aliases.iter().copied()))
+                .worker_type(worker_type)
+                .health_config(no_health_check())
+                .build(),
+        )
     }
 
     fn assert_sampling_defaults_group_values(
@@ -2227,6 +2391,219 @@ mod tests {
         let stats = registry.stats();
         assert_eq!(stats.total_workers, 1);
         assert_eq!(stats.total_models, 2);
+    }
+
+    #[test]
+    fn test_model_alias_resolves_to_canonical_model() {
+        let registry = WorkerRegistry::new();
+        let aliased = worker_with_model_aliases(
+            "http://aliased:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Prefill,
+        );
+        let canonical_only =
+            worker_with_model_aliases("http://canonical:8080", "GLM-5.2", &[], WorkerType::Decode);
+
+        registry.register(aliased).unwrap();
+        registry.register(canonical_only).unwrap();
+
+        let canonical_workers = registry.get_by_model("GLM-5.2");
+        assert_eq!(canonical_workers.len(), 2);
+        let alias_workers = registry.get_by_model("GLM-5.2-Coding");
+        assert_eq!(alias_workers.len(), 2);
+        assert_eq!(
+            registry
+                .get_workers_filtered(
+                    Some("GLM-5.2-Coding"),
+                    Some(WorkerType::Prefill),
+                    None,
+                    None,
+                    false,
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get_workers_filtered(
+                    Some("GLM-5.2-Coding"),
+                    Some(WorkerType::Decode),
+                    None,
+                    None,
+                    false,
+                )
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            registry.resolve_model_alias("GLM-5.2-Coding").as_deref(),
+            Some("GLM-5.2")
+        );
+        assert!(registry.resolve_model_alias("GLM-5.2").is_none());
+        assert!(registry.get_by_model("glm-5.2-coding").is_empty());
+        assert!(registry.contains_model("GLM-5.2-Coding"));
+
+        let canonical_ring = registry.get_hash_ring("GLM-5.2").unwrap();
+        let alias_ring = registry.get_hash_ring("GLM-5.2-Coding").unwrap();
+        assert!(Arc::ptr_eq(&canonical_ring, &alias_ring));
+
+        registry.set_model_retry_config(
+            "GLM-5.2",
+            RetryConfig {
+                max_retries: 7,
+                ..RetryConfig::default()
+            },
+            true,
+        );
+        assert_eq!(
+            registry
+                .get_retry_config("GLM-5.2-Coding")
+                .unwrap()
+                .max_retries,
+            7
+        );
+        assert_eq!(registry.get_models(), vec!["GLM-5.2"]);
+        assert_eq!(registry.stats().total_models, 1);
+    }
+
+    #[test]
+    fn test_model_alias_tracks_shared_workers_through_removal() {
+        let registry = WorkerRegistry::new();
+        let first = worker_with_model_aliases(
+            "http://first:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Prefill,
+        );
+        let second = worker_with_model_aliases(
+            "http://second:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Decode,
+        );
+        let first_id = registry.register(first).unwrap();
+        let second_id = registry.register(second).unwrap();
+
+        assert_eq!(registry.get_by_model("GLM-5.2-Coding").len(), 2);
+        registry.remove(&first_id).unwrap();
+        let remaining = registry.get_by_model("GLM-5.2-Coding");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].url(), "http://second:8080");
+
+        registry.remove(&second_id).unwrap();
+        assert!(registry.get_by_model("GLM-5.2-Coding").is_empty());
+        assert!(registry.resolve_model_alias("GLM-5.2-Coding").is_none());
+        assert!(!registry.contains_model("GLM-5.2-Coding"));
+    }
+
+    #[test]
+    fn test_model_alias_replace_refreshes_kept_and_changed_aliases() {
+        let registry = WorkerRegistry::new();
+        let original: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .model(ModelCard::new("GLM-5.2").with_alias("old"))
+                .build(),
+        );
+        let worker_id = registry.register(original).unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .model(ModelCard::new("GLM-5.2").with_alias("new"))
+                .build(),
+        );
+
+        assert!(registry.replace(&worker_id, replacement));
+
+        assert!(registry.get_by_model("old").is_empty());
+        assert_eq!(registry.get_by_model("new").len(), 1);
+    }
+
+    #[test]
+    fn test_model_alias_conflict_keeps_first_registration() {
+        let registry = WorkerRegistry::new();
+        let first = worker_with_model_aliases(
+            "http://first:8080",
+            "model-a",
+            &["shared"],
+            WorkerType::Regular,
+        );
+        let second = worker_with_model_aliases(
+            "http://second:8080",
+            "model-b",
+            &["shared"],
+            WorkerType::Regular,
+        );
+        let first_id = registry.register(first).unwrap();
+        let second_id = registry.register(second).unwrap();
+
+        let selected = registry.get_by_model("shared");
+        assert_eq!(selected.len(), 1);
+        assert_eq!(selected[0].url(), "http://first:8080");
+        assert_eq!(
+            registry.resolve_model_alias("shared").as_deref(),
+            Some("model-a")
+        );
+        assert!(registry.get_hash_ring("shared").is_some());
+        assert!(registry.contains_model("shared"));
+
+        registry.remove(&second_id).unwrap();
+        let remaining = registry.get_by_model("shared");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].url(), "http://first:8080");
+        assert_eq!(
+            registry.resolve_model_alias("shared").as_deref(),
+            Some("model-a")
+        );
+
+        registry.remove(&first_id).unwrap();
+        assert!(registry.get_by_model("shared").is_empty());
+    }
+
+    #[test]
+    fn test_canonical_model_takes_precedence_over_conflicting_alias() {
+        let registry = WorkerRegistry::new();
+        let aliased = worker_with_model_aliases(
+            "http://aliased:8080",
+            "model-a",
+            &["shared"],
+            WorkerType::Regular,
+        );
+        let canonical =
+            worker_with_model_aliases("http://canonical:8080", "shared", &[], WorkerType::Regular);
+        registry.register(aliased).unwrap();
+        registry.register(canonical).unwrap();
+        registry.set_model_retry_config(
+            "model-a",
+            RetryConfig {
+                max_retries: 9,
+                ..RetryConfig::default()
+            },
+            true,
+        );
+
+        let workers = registry.get_by_model("shared");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url(), "http://canonical:8080");
+        assert!(registry.resolve_model_alias("shared").is_none());
+        assert!(registry.get_retry_config("shared").is_none());
+    }
+
+    #[test]
+    fn test_unknown_model_id_is_never_resolved_as_alias() {
+        let registry = WorkerRegistry::new();
+        let worker = worker_with_model_aliases(
+            "http://worker:8080",
+            "GLM-5.2",
+            &[UNKNOWN_MODEL_ID],
+            WorkerType::Regular,
+        );
+        registry.register(worker).unwrap();
+
+        assert!(registry.get_by_model(UNKNOWN_MODEL_ID).is_empty());
+        assert!(registry.resolve_model_alias(UNKNOWN_MODEL_ID).is_none());
+        assert!(!registry.contains_model(UNKNOWN_MODEL_ID));
+        assert!(registry.get_hash_ring(UNKNOWN_MODEL_ID).is_none());
     }
 
     #[test]

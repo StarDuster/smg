@@ -32,7 +32,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard},
+    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
 /// Main request processing context
@@ -50,7 +50,11 @@ pub(crate) struct RequestContext {
 pub(crate) struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
+    /// Client-supplied model ID retained for errors, dispatch metadata, the
+    /// upstream request, and request-level metrics.
     pub model_id: String,
+    /// Canonical model ID used for internal per-model lookups and selection metrics.
+    canonical_model_id: Option<Arc<str>>,
     pub tenant_request_meta: Option<TenantRequestMeta>,
 }
 
@@ -112,6 +116,7 @@ impl std::fmt::Display for FinalResponse {
 /// Shared components (injected once at creation)
 pub(crate) struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    pub worker_registry: Arc<WorkerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Configured tool parser name (from CLI `--tool-call-parser`)
@@ -375,9 +380,19 @@ pub(crate) enum ClientSelection {
 #[derive(Clone)]
 pub(crate) struct DispatchMetadata {
     pub request_id: String,
+    /// Client-supplied model ID used in external responses and request metrics.
     pub model: String,
+    /// Canonical model ID used only for model-specific parser selection.
+    pub canonical_model: Option<Arc<str>>,
     pub created: u64,
     pub weight_version: Option<String>,
+}
+
+impl DispatchMetadata {
+    /// Return the model ID used for parser lookup without allocating.
+    pub fn canonical_model_id(&self) -> &str {
+        self.canonical_model.as_deref().unwrap_or(&self.model)
+    }
 }
 
 /// Load guards for worker load tracking
@@ -448,6 +463,40 @@ pub(crate) struct ResponseState {
 }
 
 impl RequestContext {
+    fn new(
+        request_type: RequestType,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        let canonical_model_id = components.worker_registry.resolve_model_alias(&model_id);
+        Self {
+            input: RequestInput {
+                request_type,
+                headers,
+                model_id,
+                canonical_model_id,
+                tenant_request_meta: None,
+            },
+            components,
+            state: ProcessingState::default(),
+        }
+    }
+
+    /// Return the canonical model ID for internal registries and configuration.
+    /// Unknown and wildcard names remain unchanged.
+    pub fn canonical_model_id(&self) -> &str {
+        self.input
+            .canonical_model_id
+            .as_deref()
+            .unwrap_or(&self.input.model_id)
+    }
+
+    /// Clone the resolved canonical model ID for state that outlives this context borrow.
+    pub fn canonical_model_id_arc(&self) -> Option<Arc<str>> {
+        self.input.canonical_model_id.clone()
+    }
+
     /// Create context for chat completion request
     pub fn for_chat(
         request: Arc<ChatCompletionRequest>,
@@ -455,16 +504,7 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Chat(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
-            components,
-            state: ProcessingState::default(),
-        }
+        Self::new(RequestType::Chat(request), headers, model_id, components)
     }
 
     /// Create context for generate request
@@ -474,16 +514,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Generate(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Generate(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for completion request
@@ -493,16 +529,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Completion(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Completion(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for Responses API request
@@ -512,16 +544,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Responses(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Responses(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for embedding request
@@ -531,16 +559,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Embedding(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Embedding(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for classify request
@@ -550,16 +574,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Classify(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Classify(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for messages request
@@ -569,16 +589,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Messages(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Messages(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Get chat request (panics if not chat)

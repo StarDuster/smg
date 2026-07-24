@@ -103,9 +103,7 @@ pub(crate) fn validate_worker_availability(
     worker_registry: &Arc<WorkerRegistry>,
     model: &str,
 ) -> Option<Response> {
-    let available_models = worker_registry.get_models();
-
-    if !available_models.contains(&model.to_string()) {
+    if !worker_registry.contains_model(model) {
         return Some(error::model_not_found(model));
     }
 
@@ -173,5 +171,32 @@ pub(crate) async fn persist_response_if_needed(
         } else {
             debug!("Persisted response: {}", response.id);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
+
+    use super::*;
+    use crate::worker::{BasicWorkerBuilder, UNKNOWN_MODEL_ID};
+
+    #[test]
+    fn worker_availability_accepts_alias_and_preserves_unknown_rejection() {
+        let registry = Arc::new(WorkerRegistry::new());
+        let worker = BasicWorkerBuilder::new("http://worker:8080")
+            .model(ModelCard::new("canonical-model").with_alias("model-alias"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry.register_or_replace(Arc::new(worker));
+
+        assert!(validate_worker_availability(&registry, "model-alias").is_none());
+
+        let response = validate_worker_availability(&registry, UNKNOWN_MODEL_ID)
+            .expect("unknown model should remain rejected for Responses");
+        assert_eq!(response.status(), http::StatusCode::NOT_FOUND);
     }
 }

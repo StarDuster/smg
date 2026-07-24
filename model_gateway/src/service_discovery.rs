@@ -29,7 +29,7 @@ use tracing::{debug, error, info, warn};
 use crate::{
     app_context::AppContext,
     observability::metrics::{metrics_labels, Metrics},
-    workflow::Job,
+    workflow::{Job, WorkerRegistrationMode},
 };
 
 /// Source for per-worker model_id override during Kubernetes service discovery.
@@ -764,6 +764,7 @@ async fn handle_pod_event(
 
             let job = Job::AddWorker {
                 config: Box::new(config.clone()),
+                registration_mode: WorkerRegistrationMode::Upsert,
             };
 
             if let Some(job_queue) = app_context.worker_job_queue.get() {

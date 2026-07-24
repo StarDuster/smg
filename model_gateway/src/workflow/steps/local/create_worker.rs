@@ -13,7 +13,7 @@ use crate::{
         resilience::resolve_resilience, worker::RuntimeType, BasicWorkerBuilder, ConnectionMode,
         Worker, UNKNOWN_MODEL_ID,
     },
-    workflow::data::{WorkerKind, WorkerWorkflowData},
+    workflow::data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
 };
 
 /// Step 3: Create worker object(s) with merged configuration + metadata.
@@ -40,11 +40,11 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
                 WorkflowError::ContextValueNotFound("connection_mode".to_string())
             })?;
 
-        // Check if worker already exists
-        if app_context
-            .worker_registry
-            .get_by_url(&config.url)
-            .is_some()
+        if context.data.registration_mode == WorkerRegistrationMode::CreateOnly
+            && app_context
+                .worker_registry
+                .get_by_url(&config.url)
+                .is_some()
         {
             return Err(WorkflowError::StepFailed {
                 step_id: StepId::new("create_worker"),

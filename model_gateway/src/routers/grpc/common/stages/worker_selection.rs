@@ -91,7 +91,8 @@ impl PipelineStage for WorkerSelectionStage {
 
         let headers = ctx.input.headers.as_ref();
 
-        let model_id = ctx.input.model_id.as_str();
+        let requested_model_id = ctx.input.model_id.as_str();
+        let model_id = ctx.canonical_model_id();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
                 match self.select_single_worker(model_id, text, tokens, headers) {
@@ -100,10 +101,10 @@ impl PipelineStage for WorkerSelectionStage {
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "Regular",
-                            model_id = %model_id,
+                            model_id = %requested_model_id,
                             "No available workers for model"
                         );
-                        return Err(error::model_not_found(model_id));
+                        return Err(error::model_not_found(requested_model_id));
                     }
                 }
             }
@@ -119,10 +120,10 @@ impl PipelineStage for WorkerSelectionStage {
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "PrefillDecode",
-                            model_id = %model_id,
+                            model_id = %requested_model_id,
                             "No available PD worker pairs for model"
                         );
-                        return Err(error::model_not_found(model_id));
+                        return Err(error::model_not_found(requested_model_id));
                     }
                 }
             }
@@ -164,10 +165,10 @@ impl PipelineStage for WorkerSelectionStage {
                         error!(
                             function = "WorkerSelectionStage::execute",
                             mode = "EncodePrefillDecode",
-                            model_id = %model_id,
+                            model_id = %requested_model_id,
                             "No available encode/prefill/decode worker set for model"
                         );
-                        return Err(error::model_not_found(model_id));
+                        return Err(error::model_not_found(requested_model_id));
                     }
                 }
             }

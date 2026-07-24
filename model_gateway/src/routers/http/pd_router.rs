@@ -1532,6 +1532,8 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::model_card::ModelCard;
+
     use super::*;
     use crate::{
         config::PolicyConfig,
@@ -1694,6 +1696,34 @@ mod tests {
 
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_accepts_model_alias() {
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            ("http://prefill", WorkerType::Prefill),
+            ("http://decode", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .model(ModelCard::new("GLM-5.2").with_alias("GLM-5.2-Coding"))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register(Arc::new(worker)).unwrap();
+        }
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, "GLM-5.2-Coding", None)
+            .await
+            .expect("alias should select a PD pair");
+        assert_eq!(prefill.url(), "http://prefill");
+        assert_eq!(decode.url(), "http://decode");
+
+        assert!(router
+            .select_pd_pair(None, "GLM-5.2-Unknown", None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

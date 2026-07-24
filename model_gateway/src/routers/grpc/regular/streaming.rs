@@ -296,6 +296,7 @@ impl StreamingProcessor {
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
         let model = &dispatch.model;
+        let parser_model_id = dispatch.canonical_model_id();
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
 
@@ -304,7 +305,7 @@ impl StreamingProcessor {
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                model,
+                parser_model_id,
             );
 
         // If the template supports a thinking toggle and the user enabled it,
@@ -346,7 +347,7 @@ impl StreamingProcessor {
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_deref(),
-                model,
+                parser_model_id,
             );
 
         if separate_reasoning && !reasoning_parser_available {
@@ -449,6 +450,7 @@ impl StreamingProcessor {
                                 think_in_prefill,
                                 request_id,
                                 model,
+                                parser_model_id,
                                 created,
                                 system_fingerprint,
                             )
@@ -496,6 +498,7 @@ impl StreamingProcessor {
                                     tools_ref,
                                     request_id,
                                     model,
+                                    parser_model_id,
                                     created,
                                     system_fingerprint,
                                     history_tool_calls_count,
@@ -1229,6 +1232,7 @@ impl StreamingProcessor {
         think_in_prefill: bool,
         request_id: &str,
         model: &str,
+        parser_model_id: &str,
         created: u64,
         system_fingerprint: Option<&str>,
     ) -> (String, Option<ChatCompletionStreamResponse>, bool) {
@@ -1241,7 +1245,7 @@ impl StreamingProcessor {
             let mut parser = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                model,
+                parser_model_id,
             )
             .expect("Parser should be available - checked upfront");
             if thinking_override {
@@ -1352,6 +1356,7 @@ impl StreamingProcessor {
         tools: &[Tool],
         request_id: &str,
         model: &str,
+        parser_model_id: &str,
         created: u64,
         system_fingerprint: Option<&str>,
         history_tool_calls_count: usize,
@@ -1366,13 +1371,13 @@ impl StreamingProcessor {
         )]
         tool_parsers.entry(index).or_insert_with(|| {
             let parser = if use_json_parser {
-                utils::create_tool_parser(&self.tool_parser_factory, Some("json"), model)
+                utils::create_tool_parser(&self.tool_parser_factory, Some("json"), parser_model_id)
                     .expect("JSON parser should be available")
             } else {
                 utils::create_tool_parser(
                     &self.tool_parser_factory,
                     self.configured_tool_parser.as_deref(),
-                    model,
+                    parser_model_id,
                 )
                 .expect("Parser should be available - checked upfront")
             };
@@ -1708,6 +1713,7 @@ impl StreamingProcessor {
 
         let request_id = &dispatch.request_id;
         let model = &dispatch.model;
+        let parser_model_id = dispatch.canonical_model_id();
 
         let has_tools = original_request.tools.is_some();
 
@@ -1746,7 +1752,7 @@ impl StreamingProcessor {
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
             self.configured_reasoning_parser.as_deref(),
-            model,
+            parser_model_id,
         );
         let separate_reasoning = reasoning_requires_special_tokens
             || matches!(
@@ -1760,7 +1766,7 @@ impl StreamingProcessor {
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                model,
+                parser_model_id,
             );
 
         // Determine if thinking is effectively ON (for mark_reasoning_started).
@@ -1786,7 +1792,7 @@ impl StreamingProcessor {
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_deref(),
-                model,
+                parser_model_id,
             );
 
         let has_structural_tag = self
@@ -1825,7 +1831,7 @@ impl StreamingProcessor {
                 } else {
                     self.configured_tool_parser.as_deref()
                 };
-                utils::create_tool_parser(&self.tool_parser_factory, parser_name, model)
+                utils::create_tool_parser(&self.tool_parser_factory, parser_name, parser_model_id)
             } else {
                 None
             };
@@ -1884,7 +1890,7 @@ impl StreamingProcessor {
                                 &mut reasoning_parser,
                                 thinking_override,
                                 think_in_prefill,
-                                model,
+                                parser_model_id,
                             )
                             .await
                         } else {

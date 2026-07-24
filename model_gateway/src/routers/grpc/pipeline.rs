@@ -1434,3 +1434,101 @@ mod build_parity_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod alias_pipeline_tests {
+    use llm_tokenizer::{traits::Tokenizer, MockTokenizer, TokenizerRegistry};
+    use openai_protocol::{
+        generate::GenerateRequest, model_card::ModelCard, worker::HealthCheckConfig,
+    };
+    use serde_json::json;
+
+    use super::*;
+    use crate::{
+        config::types::PolicyConfig,
+        worker::{BasicWorkerBuilder, ConnectionMode, RuntimeType, WorkerType},
+    };
+
+    const CANONICAL_MODEL: &str = "canonical-model";
+    const MODEL_ALIAS: &str = "model-alias";
+
+    fn register_pd_worker(registry: &WorkerRegistry, url: &str, worker_type: WorkerType) {
+        let worker = BasicWorkerBuilder::new(url)
+            .worker_type(worker_type)
+            .connection_mode(ConnectionMode::Grpc)
+            .runtime_type(RuntimeType::Sglang)
+            .model(ModelCard::new(CANONICAL_MODEL).with_alias(MODEL_ALIAS))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        registry.register(Arc::new(worker)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn pd_generate_alias_passes_preparation_before_worker_selection() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        register_pd_worker(
+            &worker_registry,
+            "grpc://prefill:30000",
+            WorkerType::Prefill,
+        );
+        register_pd_worker(&worker_registry, "grpc://decode:30000", WorkerType::Decode);
+
+        let tokenizer_registry = Arc::new(TokenizerRegistry::new());
+        let tokenizer = Arc::new(MockTokenizer::new()) as Arc<dyn Tokenizer>;
+        tokenizer_registry
+            .load("tokenizer-id", CANONICAL_MODEL, "test", || async move {
+                Ok(tokenizer)
+            })
+            .await
+            .unwrap();
+
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        let deps = PipelineDeps::pair(worker_registry.clone(), policy_registry);
+        let pipeline = RequestPipeline::build(Endpoint::Chat, Mode::PrefillDecode, &deps).unwrap();
+        let components = Arc::new(SharedComponents {
+            tokenizer_registry,
+            worker_registry,
+            tool_parser_factory: ToolParserFactory::default(),
+            reasoning_parser_factory: ReasoningParserFactory::default(),
+            configured_tool_parser: None,
+            configured_reasoning_parser: None,
+            multimodal: None,
+        });
+        let request: GenerateRequest = serde_json::from_value(json!({
+            "model": MODEL_ALIAS,
+            "text": "Hello"
+        }))
+        .unwrap();
+        let mut ctx = RequestContext::for_generate(
+            Arc::new(request),
+            None,
+            MODEL_ALIAS.to_string(),
+            components,
+        );
+
+        assert_eq!(ctx.input.model_id, MODEL_ALIAS);
+        assert_eq!(ctx.canonical_model_id(), CANONICAL_MODEL);
+
+        for stage in pipeline.stages.iter() {
+            assert!(stage.execute(&mut ctx).await.unwrap().is_none());
+            if ctx.state.workers.is_some() {
+                break;
+            }
+        }
+
+        assert_eq!(ctx.input.model_id, MODEL_ALIAS);
+        assert!(ctx.state.tokenizer.is_some());
+        match ctx.state.workers.as_ref().unwrap() {
+            WorkerSelection::Disaggregated {
+                prefill, decode, ..
+            } => {
+                assert_eq!(prefill.url(), "grpc://prefill:30000");
+                assert_eq!(decode.url(), "grpc://decode:30000");
+            }
+            WorkerSelection::Single { .. } => panic!("expected PD worker selection"),
+        }
+    }
+}

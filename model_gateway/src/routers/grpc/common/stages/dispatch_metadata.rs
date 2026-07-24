@@ -56,10 +56,12 @@ impl PipelineStage for DispatchMetadataStage {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
+        let canonical_model = ctx.canonical_model_id_arc();
 
         ctx.state.dispatch = Some(DispatchMetadata {
             request_id,
             model,
+            canonical_model,
             created,
             weight_version: Some(weight_version),
         });

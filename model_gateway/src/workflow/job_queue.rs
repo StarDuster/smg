@@ -26,6 +26,7 @@ use crate::{
         create_worker_removal_workflow_data, create_worker_update_workflow_data,
         create_worker_workflow_data, McpServerConfigRequest, TokenizerConfigRequest,
         TokenizerRemovalRequest, WasmModuleConfigRequest, WasmModuleRemovalRequest,
+        WorkerRegistrationMode,
     },
 };
 
@@ -34,6 +35,7 @@ use crate::{
 pub enum Job {
     AddWorker {
         config: Box<WorkerSpec>,
+        registration_mode: WorkerRegistrationMode,
     },
     UpdateWorker {
         url: String,
@@ -86,7 +88,7 @@ impl Job {
     /// Get worker URL, MCP server name, WASM module, or tokenizer identifier for logging and status tracking
     pub fn worker_url(&self) -> &str {
         match self {
-            Job::AddWorker { config } => &config.url,
+            Job::AddWorker { config, .. } => &config.url,
             Job::UpdateWorker { url, .. } => url,
             Job::RemoveWorker { url, .. } => url,
             Job::InitializeWorkersFromConfig { .. } => "startup",
@@ -310,7 +312,10 @@ impl JobQueue {
     /// Execute a specific job
     async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
         match job {
-            Job::AddWorker { config } => {
+            Job::AddWorker {
+                config,
+                registration_mode,
+            } => {
                 let engines = context
                     .workflow_engines
                     .get()
@@ -319,8 +324,11 @@ impl JobQueue {
                 let timeout_duration =
                     Duration::from_secs(context.router_config.worker_startup_timeout_secs + 30);
 
-                let workflow_data =
-                    create_worker_workflow_data((**config).clone(), Arc::clone(context));
+                let workflow_data = create_worker_workflow_data(
+                    (**config).clone(),
+                    *registration_mode,
+                    Arc::clone(context),
+                );
                 let instance_id = engines
                     .worker_registration
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
@@ -566,6 +574,7 @@ impl JobQueue {
 
                     let job = Job::AddWorker {
                         config: Box::new(config),
+                        registration_mode: WorkerRegistrationMode::Upsert,
                     };
 
                     if let Some(queue) = context.worker_job_queue.get() {
@@ -758,6 +767,7 @@ async fn submit_external_worker_jobs(
 
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::Upsert,
         };
 
         if let Some(queue) = context.worker_job_queue.get() {

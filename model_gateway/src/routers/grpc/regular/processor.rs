@@ -69,6 +69,7 @@ impl ResponseProcessor {
         history_tool_calls_count: usize,
         reasoning_parser_available: bool,
         tool_parser_available: bool,
+        parser_model_id: &str,
     ) -> Result<ChatChoice, String> {
         stop_decoder.reset();
         // Decode tokens
@@ -105,7 +106,7 @@ impl ResponseProcessor {
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                &original_request.model,
+                parser_model_id,
             ) {
                 // If the template injected `<think>` in the prefill (thinking toggle
                 // is supported and effectively ON), start in reasoning mode.
@@ -169,6 +170,7 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
+                        parser_model_id,
                         &original_request.model,
                         original_request.tools.as_deref().unwrap_or(&[]),
                         history_tool_calls_count,
@@ -230,13 +232,14 @@ impl ResponseProcessor {
             response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
+        let parser_model_id = dispatch.canonical_model_id();
 
         // Check parser availability once upfront (not per choice)
         let reasoning_parser_available = chat_request.separate_reasoning
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                &chat_request.model,
+                parser_model_id,
             );
 
         let tool_choice_enabled = !matches!(
@@ -249,7 +252,7 @@ impl ResponseProcessor {
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_deref(),
-                &chat_request.model,
+                parser_model_id,
             );
 
         // Log once per request (not per choice)
@@ -280,6 +283,7 @@ impl ResponseProcessor {
                     history_tool_calls_count,
                     reasoning_parser_available,
                     tool_parser_available,
+                    parser_model_id,
                 )
                 .await
             {
@@ -311,7 +315,8 @@ impl ResponseProcessor {
     pub async fn parse_tool_calls(
         &self,
         processed_text: &str,
-        model: &str,
+        parser_model_id: &str,
+        requested_model_id: &str,
         tools: &[Tool],
         history_tool_calls_count: usize,
     ) -> (Option<Vec<ToolCall>>, String) {
@@ -319,7 +324,7 @@ impl ResponseProcessor {
         let pooled_parser = utils::get_tool_parser(
             &self.tool_parser_factory,
             self.configured_tool_parser.as_deref(),
-            model,
+            parser_model_id,
         );
 
         // Try parsing directly (parser will handle detection internally). Pass the
@@ -345,7 +350,7 @@ impl ResponseProcessor {
                     .map(|(index, tc)| {
                         // Generate ID for this tool call
                         let id = utils::generate_tool_call_id(
-                            model,
+                            requested_model_id,
                             &tc.function.name,
                             index,
                             history_tool_calls_count,
@@ -516,13 +521,14 @@ impl ResponseProcessor {
         }
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
+        let parser_model_id = dispatch.canonical_model_id();
 
         // Check parser availability. Run parser when the user explicitly enabled thinking,
         // or when the selected parser needs structural special tokens (e.g. Inkling).
         let reasoning_requires_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &self.reasoning_parser_factory,
             self.configured_reasoning_parser.as_deref(),
-            &messages_request.model,
+            parser_model_id,
         );
         let separate_reasoning = reasoning_requires_special_tokens
             || matches!(
@@ -536,7 +542,7 @@ impl ResponseProcessor {
             && utils::check_reasoning_parser_availability(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                &messages_request.model,
+                parser_model_id,
             );
 
         let tool_choice_enabled = !matches!(
@@ -549,7 +555,7 @@ impl ResponseProcessor {
             && utils::check_tool_parser_availability(
                 &self.tool_parser_factory,
                 self.configured_tool_parser.as_deref(),
-                &messages_request.model,
+                parser_model_id,
             );
 
         if separate_reasoning && !reasoning_parser_available {
@@ -604,7 +610,7 @@ impl ResponseProcessor {
             if let Some(mut parser) = utils::create_reasoning_parser(
                 &self.reasoning_parser_factory,
                 self.configured_reasoning_parser.as_deref(),
-                &messages_request.model,
+                parser_model_id,
             ) {
                 // If thinking is effectively ON and template has a toggle, start in reasoning mode.
                 {
@@ -672,6 +678,7 @@ impl ResponseProcessor {
                 (tool_calls, processed_text) = self
                     .parse_tool_calls(
                         &processed_text,
+                        parser_model_id,
                         &messages_request.model,
                         &chat_tools,
                         utils::message_utils::get_history_tool_calls_count_messages(
