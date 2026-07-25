@@ -326,7 +326,7 @@ impl JobQueue {
 
                 let workflow_data = create_worker_workflow_data(
                     (**config).clone(),
-                    *registration_mode,
+                    registration_mode.clone(),
                     Arc::clone(context),
                 );
                 let instance_id = engines

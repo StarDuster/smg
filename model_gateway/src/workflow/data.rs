@@ -59,19 +59,32 @@ pub trait WorkerRegistrationData: WorkflowData {
     /// Get the labels for policy registration.
     fn get_labels(&self) -> Option<&HashMap<String, String>>;
 
-    /// Select create-only or upsert behavior for the final registry write.
-    fn registration_mode(&self) -> WorkerRegistrationMode;
+    /// Select the semantics of the final registry write.
+    ///
+    /// Defaults to upsert, which is what every caller did before this method
+    /// existed.
+    fn registration_mode(&self) -> WorkerRegistrationMode {
+        WorkerRegistrationMode::Upsert
+    }
 }
 
 /// Semantics of the final worker registry write.
-///
-/// API `POST /workers` is create-only. Full replacement, startup, and service
-/// discovery reconcile existing state and therefore use upsert.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum WorkerRegistrationMode {
+    /// `POST /workers`: fail when the URL is already registered.
     CreateOnly,
+    /// Startup and service discovery: register the URL, replacing whatever
+    /// holds it. Both reconcile declared state against the registry.
     #[default]
     Upsert,
+    /// `PUT /workers/{id}`: replace the worker only while `worker_id` still
+    /// holds the URL.
+    ///
+    /// `PUT` answers 202 and registers later, so a `DELETE` (or `DELETE` +
+    /// `POST`) can land in between. Binding the write to the ID the request
+    /// validated makes the late write fail instead of resurrecting a deleted
+    /// worker or overwriting a newly created one.
+    ReplaceById { worker_id: String },
 }
 
 /// Wrapper for worker list that can be serialized
@@ -163,7 +176,7 @@ impl WorkerRegistrationData for WorkerWorkflowData {
     }
 
     fn registration_mode(&self) -> WorkerRegistrationMode {
-        self.registration_mode
+        self.registration_mode.clone()
     }
 }
 

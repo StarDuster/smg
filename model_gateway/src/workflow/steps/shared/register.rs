@@ -25,21 +25,73 @@ use crate::{
 /// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
 
+fn step_failed(message: String) -> WorkflowError {
+    WorkflowError::StepFailed {
+        step_id: StepId::new("register_workers"),
+        message,
+    }
+}
+
+/// Reject a batch before any of it is written.
+///
+/// A data-parallel spec expands to one worker per rank, so a mode that can
+/// reject a single worker can also leave earlier ranks registered. Checking
+/// the whole batch first keeps that outcome out of the registry.
+fn check_batch(
+    registry: &WorkerRegistry,
+    workers: &[Arc<dyn Worker>],
+    registration_mode: &WorkerRegistrationMode,
+) -> WorkflowResult<()> {
+    match registration_mode {
+        WorkerRegistrationMode::CreateOnly => {
+            for worker in workers {
+                if registry.get_by_url(worker.url()).is_some() {
+                    return Err(step_failed(format!(
+                        "Worker {} already exists",
+                        worker.url()
+                    )));
+                }
+            }
+            Ok(())
+        }
+        // One ID replaces one worker. `PUT` rejects the URL change that a
+        // multi-worker expansion implies, so this batch always holds one
+        // worker; the check keeps a future caller from writing a partial batch.
+        WorkerRegistrationMode::ReplaceById { worker_id } if workers.len() != 1 => {
+            Err(step_failed(format!(
+                "Replacing worker {worker_id} needs exactly one worker, got {}",
+                workers.len()
+            )))
+        }
+        _ => Ok(()),
+    }
+}
+
 fn register_worker(
     registry: &WorkerRegistry,
     worker: Arc<dyn Worker>,
-    registration_mode: WorkerRegistrationMode,
+    registration_mode: &WorkerRegistrationMode,
 ) -> WorkflowResult<WorkerId> {
     match registration_mode {
-        WorkerRegistrationMode::CreateOnly => {
-            registry
-                .register(worker.clone())
-                .ok_or_else(|| WorkflowError::StepFailed {
-                    step_id: StepId::new("register_workers"),
-                    message: format!("Worker {} already exists", worker.url()),
-                })
-        }
+        WorkerRegistrationMode::CreateOnly => registry
+            .register(worker.clone())
+            .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.url()))),
         WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
+        WorkerRegistrationMode::ReplaceById { worker_id } => {
+            let worker_id = WorkerId::from_string(worker_id.clone());
+            let url = worker.url().to_string();
+            // Fails when the ID no longer exists, which is exactly the case
+            // where a concurrent DELETE (or DELETE + POST) has already retired
+            // the worker this replacement was written against.
+            if registry.replace_claiming_local(&worker_id, worker) {
+                Ok(worker_id)
+            } else {
+                Err(step_failed(format!(
+                    "Worker {} at {url} is no longer registered, so the replacement was dropped",
+                    worker_id.as_str()
+                )))
+            }
+        }
     }
 }
 
@@ -60,11 +112,13 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         let mut worker_ids = Vec::with_capacity(workers.len());
         let registration_mode = context.data.registration_mode();
 
+        check_batch(&app_context.worker_registry, workers, &registration_mode)?;
+
         for worker in workers {
             let worker_id = register_worker(
                 &app_context.worker_registry,
                 Arc::clone(worker),
-                registration_mode,
+                &registration_mode,
             )?;
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
@@ -167,12 +221,22 @@ mod tests {
     use super::*;
     use crate::worker::BasicWorkerBuilder;
 
-    fn worker(model_id: &str) -> Arc<dyn Worker> {
+    fn worker_at(url: &str, model_id: &str) -> Arc<dyn Worker> {
         Arc::new(
-            BasicWorkerBuilder::new("http://worker:8080")
+            BasicWorkerBuilder::new(url)
                 .model(ModelCard::new(model_id))
                 .build(),
         )
+    }
+
+    fn worker(model_id: &str) -> Arc<dyn Worker> {
+        worker_at("http://worker:8080", model_id)
+    }
+
+    fn replace_by_id(worker_id: &WorkerId) -> WorkerRegistrationMode {
+        WorkerRegistrationMode::ReplaceById {
+            worker_id: worker_id.as_str().to_string(),
+        }
     }
 
     #[test]
@@ -183,7 +247,7 @@ mod tests {
         let result = register_worker(
             &registry,
             worker("replacement-model"),
-            WorkerRegistrationMode::CreateOnly,
+            &WorkerRegistrationMode::CreateOnly,
         );
 
         assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
@@ -203,7 +267,7 @@ mod tests {
         let new_id = register_worker(
             &registry,
             worker("replacement-model"),
-            WorkerRegistrationMode::Upsert,
+            &WorkerRegistrationMode::Upsert,
         )
         .unwrap();
 
@@ -213,5 +277,99 @@ mod tests {
         assert_eq!(registry.get_id_by_url("http://worker:8080"), Some(new_id));
         assert_eq!(registry.get_by_model("replacement-model").len(), 1);
         assert!(registry.get_by_model("original-model").is_empty());
+    }
+
+    #[test]
+    fn create_only_rejects_the_batch_before_registering_any_worker() {
+        let registry = WorkerRegistry::new();
+        registry
+            .register(worker_at("http://rank1:8080", "taken"))
+            .unwrap();
+
+        // A data-parallel spec expands to several workers. Rank 0 is free and
+        // rank 1 is taken, so the whole batch must be refused untouched.
+        let batch = vec![
+            worker_at("http://rank0:8080", "new-model"),
+            worker_at("http://rank1:8080", "new-model"),
+        ];
+        let result = check_batch(&registry, &batch, &WorkerRegistrationMode::CreateOnly);
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert!(registry.get_by_url("http://rank0:8080").is_none());
+        assert_eq!(registry.get_by_model("taken").len(), 1);
+        assert!(registry.get_by_model("new-model").is_empty());
+    }
+
+    #[test]
+    fn replace_by_id_refuses_a_multi_worker_batch() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+
+        let batch = vec![
+            worker_at("http://worker:8080", "new-model"),
+            worker_at("http://worker:8081", "new-model"),
+        ];
+        let result = check_batch(&registry, &batch, &replace_by_id(&original_id));
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+    }
+
+    #[test]
+    fn replace_by_id_applies_the_new_spec() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+
+        let new_id = register_worker(
+            &registry,
+            worker("replacement-model"),
+            &replace_by_id(&original_id),
+        )
+        .unwrap();
+
+        assert_eq!(new_id, original_id);
+        assert_eq!(registry.get_by_model("replacement-model").len(), 1);
+        assert!(registry.get_by_model("original-model").is_empty());
+    }
+
+    #[test]
+    fn replace_by_id_does_not_resurrect_a_removed_worker() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+        // Stands in for a DELETE that lands while the replacement workflow runs.
+        assert!(registry.remove(&original_id).is_some());
+
+        let result = register_worker(
+            &registry,
+            worker("replacement-model"),
+            &replace_by_id(&original_id),
+        );
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert!(registry.get_by_url("http://worker:8080").is_none());
+    }
+
+    #[test]
+    fn replace_by_id_does_not_overwrite_a_recreated_worker() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+        // Stands in for DELETE + POST on the same URL while the replacement
+        // workflow runs: same URL, different worker, new ID.
+        assert!(registry.remove(&original_id).is_some());
+        let recreated_id = registry.register(worker("recreated-model")).unwrap();
+        assert_ne!(recreated_id, original_id);
+
+        let result = register_worker(
+            &registry,
+            worker("replacement-model"),
+            &replace_by_id(&original_id),
+        );
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert_eq!(
+            registry.get_id_by_url("http://worker:8080"),
+            Some(recreated_id)
+        );
+        assert_eq!(registry.get_by_model("recreated-model").len(), 1);
+        assert!(registry.get_by_model("replacement-model").is_empty());
     }
 }

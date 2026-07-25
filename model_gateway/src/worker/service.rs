@@ -323,11 +323,16 @@ impl WorkerService {
             });
         }
 
-        // Re-run the full registration workflow (model discovery, etc.)
-        // The workflow uses register_or_replace() which does overwrite-then-diff.
+        // Re-run the full registration workflow (model discovery, etc.).
+        // The workflow registers with overwrite-then-diff, bound to the ID
+        // validated above: the job runs after this call returns 202, so a
+        // concurrent DELETE (or DELETE + POST) must make the write fail
+        // rather than resurrect this worker or overwrite its successor.
         let job = Job::AddWorker {
             config: Box::new(config),
-            registration_mode: WorkerRegistrationMode::Upsert,
+            registration_mode: WorkerRegistrationMode::ReplaceById {
+                worker_id: worker_id.as_str().to_string(),
+            },
         };
 
         let job_queue = self.get_job_queue()?;

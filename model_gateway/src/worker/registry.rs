@@ -664,10 +664,10 @@ impl WorkerRegistry {
 
     /// Replace an existing worker with a new one (overwrite-then-diff).
     ///
-    /// Used by `PUT /workers/{id}` and K8s discovery when a worker with
-    /// the same URL already exists. Updates the worker object in-place and
-    /// diffs the model index to avoid a transient gap where the worker is
-    /// missing from indexes.
+    /// Updates the worker object in-place and diffs the model index to avoid
+    /// a transient gap where the worker is missing from indexes. Leaves the
+    /// origin untouched; callers that claim the worker for this node use
+    /// [`Self::replace_claiming_local`] instead.
     ///
     /// Returns `true` if the worker was replaced, `false` if the ID was
     /// not found or the URL would change (URL changes require
@@ -677,6 +677,26 @@ impl WorkerRegistry {
     /// mutation lock for the entire diff + broadcast sequence.
     pub fn replace(&self, worker_id: &WorkerId, new_worker: Arc<dyn Worker>) -> bool {
         self.replace_inner(worker_id, new_worker, None)
+    }
+
+    /// Replace an existing worker and claim local ownership of its URL.
+    ///
+    /// Same as [`Self::replace`], plus the origin promotion that
+    /// [`Self::register_or_replace`] performs: the caller configures this
+    /// worker on this node, so the worker must be published to the mesh and
+    /// must not be deleted by a peer tombstone.
+    ///
+    /// Used by `PUT /workers/{worker_id}`. The `worker_id` check is the point
+    /// of this method: `PUT` answers 202 and registers later, so a `DELETE`
+    /// (or `DELETE` + `POST`) can land in between. Returning `false` for a
+    /// missing ID makes the late write fail instead of resurrecting a deleted
+    /// worker or overwriting a newly created one.
+    pub fn replace_claiming_local(
+        &self,
+        worker_id: &WorkerId,
+        new_worker: Arc<dyn Worker>,
+    ) -> bool {
+        self.replace_inner(worker_id, new_worker, Some(WorkerOrigin::Local))
     }
 
     /// Core replacement shared by [`Self::replace`] and
