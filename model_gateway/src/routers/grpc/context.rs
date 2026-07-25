@@ -32,7 +32,9 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{
+        PrefillPermit, PrefillPhaseGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+    },
 };
 
 /// Main request processing context
@@ -407,8 +409,13 @@ pub(crate) enum LoadGuards {
     },
     /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
     /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    ///
+    /// When prefill admission is enabled, the prefill load guard moves into a
+    /// [`PrefillGuard`] with the admission permit so both release when the
+    /// prefill phase ends; `_prefill` is `None` in that case. When admission is
+    /// disabled, `_prefill` holds the load for the full request (legacy behavior).
     Disaggregated {
-        _prefill: WorkerLoadGuard,
+        _prefill: Option<WorkerLoadGuard>,
         _decode: WorkerLoadGuard,
     },
     /// Batched completion fan-out: one guard set per sub-request so load-aware
@@ -418,28 +425,85 @@ pub(crate) enum LoadGuards {
     },
 }
 
-impl LoadGuards {
-    pub fn new(selection: &WorkerSelection, headers: Option<&HeaderMap>) -> Self {
-        match selection {
-            WorkerSelection::Single { worker } => LoadGuards::Single {
-                _guard: WorkerLoadGuard::new(worker.clone(), headers),
-            },
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::new(prefill.clone(), headers),
-                _decode: WorkerLoadGuard::new(decode.clone(), headers),
-            },
+pub(crate) type PrefillGuard = PrefillPhaseGuard;
+
+/// Phase guards produced alongside [`LoadGuards`]. Empty (`None`) for
+/// single-worker selections and whenever prefill admission is disabled.
+pub(crate) enum PrefillGuardSet {
+    None,
+    Single(Option<PrefillGuard>),
+    Batch(Vec<PrefillGuard>),
+}
+
+impl PrefillGuardSet {
+    pub fn take_single(&mut self) -> Option<PrefillGuard> {
+        match self {
+            Self::Single(guard) => guard.take(),
+            Self::None | Self::Batch(_) => None,
         }
     }
+}
 
+impl LoadGuards {
     /// One guard set per concurrent sub-request.
-    pub fn scaled(selection: &WorkerSelection, headers: Option<&HeaderMap>, count: usize) -> Self {
-        if count <= 1 {
-            Self::new(selection, headers)
-        } else {
-            Self::Batch {
-                _guards: (0..count).map(|_| Self::new(selection, headers)).collect(),
+    pub fn scaled(
+        selection: &WorkerSelection,
+        headers: Option<&HeaderMap>,
+        count: usize,
+        prefill_permit: Option<PrefillPermit>,
+    ) -> (Self, PrefillGuardSet) {
+        debug_assert!(count > 0);
+        match selection {
+            WorkerSelection::Single { worker } => {
+                let guard = || LoadGuards::Single {
+                    _guard: WorkerLoadGuard::new(worker.clone(), headers),
+                };
+                let guards = if count == 1 {
+                    guard()
+                } else {
+                    LoadGuards::Batch {
+                        _guards: (0..count).map(|_| guard()).collect(),
+                    }
+                };
+                (guards, PrefillGuardSet::None)
+            }
+            WorkerSelection::Disaggregated {
+                prefill, decode, ..
+            } => {
+                let admission_enabled = prefill_permit.is_some();
+                let guard = || LoadGuards::Disaggregated {
+                    _prefill: (!admission_enabled)
+                        .then(|| WorkerLoadGuard::new(prefill.clone(), headers)),
+                    _decode: WorkerLoadGuard::new(decode.clone(), headers),
+                };
+                let guards = if count == 1 {
+                    guard()
+                } else {
+                    LoadGuards::Batch {
+                        _guards: (0..count).map(|_| guard()).collect(),
+                    }
+                };
+                let prefill_guards = match prefill_permit {
+                    None => PrefillGuardSet::None,
+                    Some(permit) if count == 1 => PrefillGuardSet::Single(Some(
+                        PrefillPhaseGuard::new(prefill.clone(), headers, permit),
+                    )),
+                    Some(permit) => {
+                        let shared_permit = Arc::new(permit);
+                        PrefillGuardSet::Batch(
+                            (0..count)
+                                .map(|_| {
+                                    PrefillPhaseGuard::new_shared(
+                                        prefill.clone(),
+                                        headers,
+                                        shared_permit.clone(),
+                                    )
+                                })
+                                .collect(),
+                        )
+                    }
+                };
+                (guards, prefill_guards)
             }
         }
     }
@@ -897,6 +961,9 @@ pub(crate) enum ExecutionResult {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        /// Present only when prefill admission is enabled; releases the
+        /// admission slot and prefill load when the prefill phase ends.
+        prefill_guard: Option<PrefillGuard>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
     },

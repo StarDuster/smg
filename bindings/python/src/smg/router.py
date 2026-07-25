@@ -205,6 +205,12 @@ class Router:
             only). If not specified, uses the main policy. Default: None
         decode_policy: Specific load balancing policy for decode nodes (PD mode only).
             If not specified, uses the main policy. Default: None
+        prefill_max_concurrent_requests: Maximum PD requests concurrently occupying
+            the prefill phase. A non-positive value disables the limit. Default: -1
+        prefill_queue_size: Queue size for PD requests waiting for a prefill slot.
+            Only used when prefill_max_concurrent_requests is positive. Default: 100
+        prefill_queue_timeout_secs: Maximum time (in seconds) a PD request can wait
+            for a prefill slot before it is rejected. Default: 60
         request_id_headers: List of HTTP headers to check for request IDs. If not
             specified, uses common defaults: ['x-request-id', 'x-correlation-id',
             'x-trace-id', 'request-id']. Example: ['x-my-request-id',

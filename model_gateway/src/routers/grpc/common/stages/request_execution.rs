@@ -1,9 +1,9 @@
 //! Request execution stage: execute gRPC requests from an execution plan.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
-use axum::response::Response;
+use axum::{http::StatusCode, response::Response};
 use futures::future::{join_all, try_join_all};
 use tracing::{debug, error, info_span, Instrument};
 
@@ -16,7 +16,7 @@ use crate::{
             common::stages::encode::EncodeDispatchPlan,
             context::{
                 ClientSelection, ExecutionPlan, ExecutionPlanKind, ExecutionResult, LoadGuards,
-                PdTiming, RequestContext, WorkerSelection,
+                PdTiming, PrefillGuard, PrefillGuardSet, RequestContext, WorkerSelection,
             },
             proto_wrapper::{
                 ProtoEmbedRequest, ProtoGenerateRequest, ProtoRequest, ProtoResponseVariant,
@@ -25,7 +25,10 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::{RuntimeType, DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR},
+    worker::{
+        PrefillAdmission, PrefillAdmissionRejection, PrefillPermit, RuntimeType,
+        DEFAULT_BOOTSTRAP_PORT, MOONCAKE_CONNECTOR, NIXL_CONNECTOR,
+    },
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -119,11 +122,40 @@ fn mooncake_decode_params(transfer_id: &str, engine_id: &str, host: &str, port: 
 }
 
 /// Request execution stage: execute the plan produced by request building.
-pub(crate) struct RequestExecutionStage;
+pub(crate) struct RequestExecutionStage {
+    prefill_admission: Option<Arc<PrefillAdmission>>,
+}
 
 impl RequestExecutionStage {
-    pub fn new() -> Self {
-        Self
+    pub fn new(prefill_admission: Option<Arc<PrefillAdmission>>) -> Self {
+        Self { prefill_admission }
+    }
+
+    async fn acquire_prefill_permit(&self) -> Result<Option<PrefillPermit>, Response> {
+        let Some(admission) = &self.prefill_admission else {
+            return Ok(None);
+        };
+
+        admission
+            .admit()
+            .await
+            .map(Some)
+            .map_err(|reason| match reason {
+                PrefillAdmissionRejection::QueueFull => error::create_error(
+                    StatusCode::TOO_MANY_REQUESTS,
+                    "pd_prefill_queue_full",
+                    "prefill admission queue is full",
+                ),
+                PrefillAdmissionRejection::QueueTimeout => error::create_error(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "pd_prefill_queue_timeout",
+                    "timed out waiting for a prefill admission slot",
+                ),
+                PrefillAdmissionRejection::Closed => error::service_unavailable(
+                    "pd_prefill_admission_closed",
+                    "prefill admission is unavailable",
+                ),
+            })
     }
 }
 
@@ -171,11 +203,23 @@ impl PipelineStage for RequestExecutionStage {
             ExecutionPlan::Batch { requests, .. } => requests.len(),
             _ => 1,
         };
-        ctx.state.load_guards = Some(LoadGuards::scaled(
+        let needs_prefill = match &execution_plan {
+            ExecutionPlan::PrefillDecode(_) | ExecutionPlan::EncodePrefillDecode { .. } => true,
+            ExecutionPlan::Batch { kind, .. } => *kind != ExecutionPlanKind::Single,
+            ExecutionPlan::Single(_) => false,
+        };
+        let prefill_permit = if needs_prefill {
+            self.acquire_prefill_permit().await?
+        } else {
+            None
+        };
+        let (load_guards, mut prefill_guards) = LoadGuards::scaled(
             workers,
             ctx.input.headers.as_ref(),
             sub_requests,
-        ));
+            prefill_permit,
+        );
+        ctx.state.load_guards = Some(load_guards);
 
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();
@@ -203,18 +247,35 @@ impl PipelineStage for RequestExecutionStage {
                     }
                 },
                 ExecutionPlan::PrefillDecode(req) => {
-                    self.execute_pd_dispatch(req, clients, workers, model).await
+                    let guard = prefill_guards.take_single();
+                    self.execute_pd_dispatch(req, clients, workers, model, guard)
+                        .await
                 }
                 ExecutionPlan::EncodePrefillDecode { request } => {
                     // Bootstrap info was injected into the prefill request during
                     // request building; dispatch the encode jobs with the
                     // prefill+decode leg.
-                    self.execute_epd_dispatch(request, clients, workers, model, encode_dispatch)
-                        .await
+                    let guard = prefill_guards.take_single();
+                    self.execute_epd_dispatch(
+                        request,
+                        clients,
+                        workers,
+                        model,
+                        encode_dispatch,
+                        guard,
+                    )
+                    .await
                 }
                 ExecutionPlan::Batch { kind, requests, .. } => {
-                    self.execute_batch_dispatch(kind, requests, clients, workers, model)
-                        .await
+                    self.execute_batch_dispatch(
+                        kind,
+                        requests,
+                        clients,
+                        workers,
+                        model,
+                        prefill_guards,
+                    )
+                    .await
                 }
             }
         }
@@ -238,6 +299,7 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
+        prefill_guard: Option<PrefillGuard>,
     ) -> Result<ExecutionResult, Response> {
         // Dispatch based on runtime type:
         // - SGLang: parallel prefill/decode dispatch with bootstrap metadata
@@ -245,13 +307,13 @@ impl RequestExecutionStage {
         let runtime_type = workers.disaggregated_runtime_type();
         match runtime_type {
             Some(RuntimeType::Vllm) => {
-                self.execute_sequential_pd(proto_request, clients, workers, model)
+                self.execute_sequential_pd(proto_request, clients, workers, model, prefill_guard)
                     .await
             }
             Some(RuntimeType::Sglang) | Some(RuntimeType::TokenSpeed) => {
                 // These runtimes carry bootstrap rendezvous in the request
                 // and use parallel prefill/decode dispatch.
-                self.execute_parallel_pd(proto_request, clients, workers)
+                self.execute_parallel_pd(proto_request, clients, workers, prefill_guard)
                     .await
             }
             Some(RuntimeType::Trtllm)
@@ -288,12 +350,13 @@ impl RequestExecutionStage {
         workers: &WorkerSelection,
         model: &str,
         encode_dispatch: Option<EncodeDispatchPlan>,
+        prefill_guard: Option<PrefillGuard>,
     ) -> Result<ExecutionResult, Response> {
         if let Some(encode_dispatch) = encode_dispatch {
             Self::spawn_encode_dispatch(encode_dispatch);
         }
         proto_request.clear_mm_pixel_values();
-        self.execute_pd_dispatch(proto_request, clients, workers, model)
+        self.execute_pd_dispatch(proto_request, clients, workers, model, prefill_guard)
             .await
     }
 
@@ -351,24 +414,48 @@ impl RequestExecutionStage {
         clients: &ClientSelection,
         workers: &WorkerSelection,
         model: &str,
+        prefill_guards: PrefillGuardSet,
     ) -> Result<ExecutionResult, Response> {
-        let dispatches = requests.into_iter().map(|request| {
-            let mut clients = clients.clone();
-            async move {
-                match kind {
-                    ExecutionPlanKind::Single => {
-                        self.execute_single(request, &mut clients, workers).await
+        let results = match kind {
+            ExecutionPlanKind::Single => {
+                if !matches!(prefill_guards, PrefillGuardSet::None) {
+                    return Err(error::internal_error(
+                        "unexpected_prefill_guards",
+                        "single-worker batch received prefill resources",
+                    ));
+                }
+                try_join_all(requests.into_iter().map(|request| {
+                    let mut clients = clients.clone();
+                    async move { self.execute_single(request, &mut clients, workers).await }
+                }))
+                .await?
+            }
+            // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
+            ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+                // `None` when admission is disabled: every sub-request
+                // dispatches without a phase guard (legacy load accounting).
+                let guards: Vec<Option<PrefillGuard>> = match prefill_guards {
+                    PrefillGuardSet::None => requests.iter().map(|_| None).collect(),
+                    PrefillGuardSet::Batch(guards) if guards.len() == requests.len() => {
+                        guards.into_iter().map(Some).collect()
                     }
-                    // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
-                    ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-                        self.execute_pd_dispatch(request, &mut clients, workers, model)
+                    PrefillGuardSet::Single(_) | PrefillGuardSet::Batch(_) => {
+                        return Err(error::internal_error(
+                            "prefill_guard_count_mismatch",
+                            "batched Prefill resources do not match the request count",
+                        ));
+                    }
+                };
+                try_join_all(requests.into_iter().zip(guards).map(|(request, guard)| {
+                    let mut clients = clients.clone();
+                    async move {
+                        self.execute_pd_dispatch(request, &mut clients, workers, model, guard)
                             .await
                     }
-                }
+                }))
+                .await?
             }
-        });
-
-        let results = try_join_all(dispatches).await?;
+        };
         Ok(ExecutionResult::Batch { results })
     }
 
@@ -443,6 +530,7 @@ impl RequestExecutionStage {
         proto_request: ProtoGenerateRequest,
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
+        prefill_guard: Option<PrefillGuard>,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -520,6 +608,7 @@ impl RequestExecutionStage {
         Ok(ExecutionResult::PrefillDecode {
             prefill: prefill_stream,
             decode: Box::new(decode_stream),
+            prefill_guard,
             pd_timing: PdTiming {
                 prefill_start,
                 runtime,
@@ -539,6 +628,7 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
+        prefill_guard: Option<PrefillGuard>,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -693,6 +783,7 @@ impl RequestExecutionStage {
         workers.record_outcome_prefill(200);
         // Captured at drain; recorded below only once decode is established.
         let prefill_duration = prefill_start.elapsed();
+        drop(prefill_guard);
 
         // KV-transfer window: prefill drain complete to decode send complete.
         let kv_window_start = Instant::now();
