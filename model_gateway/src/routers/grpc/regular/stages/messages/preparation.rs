@@ -86,16 +86,15 @@ impl MessagePreparationStage {
         // Resolve media-part ordering from the model registry so /v1/messages
         // renders each model consistently with /v1/chat/completions.
         let model_id = ctx.input.model_id.as_str();
-        let lookup_model_id = ctx.canonical_model_id();
         let tokenizer_entry = ctx
             .components
             .tokenizer_registry
-            .get_by_name(lookup_model_id)
-            .or_else(|| ctx.components.tokenizer_registry.get_by_id(lookup_model_id));
+            .get_by_name(model_id)
+            .or_else(|| ctx.components.tokenizer_registry.get_by_id(model_id));
         let media_order = match (ctx.components.multimodal.as_ref(), tokenizer_entry.as_ref()) {
             (Some(mm_components), Some(entry)) => {
                 multimodal::resolve_media_part_order(
-                    lookup_model_id,
+                    model_id,
                     &*tokenizer,
                     mm_components,
                     &entry.id,
@@ -128,7 +127,7 @@ impl MessagePreparationStage {
 
             let placeholders = multimodal::prepare_placeholder_tokens(
                 &media_plan,
-                lookup_model_id,
+                model_id,
                 &*tokenizer,
                 mm_components,
                 &tokenizer_id,
@@ -149,7 +148,7 @@ impl MessagePreparationStage {
                 Some(placeholders),
                 Some((
                     mm_components,
-                    lookup_model_id,
+                    model_id,
                     tokenizer_id,
                     tokenizer_source,
                     media_plan,
@@ -222,12 +221,12 @@ impl MessagePreparationStage {
 
         // Step 4: Multimodal processing (fetch + preprocess + expand tokens + hash)
         let mut multimodal_intermediate = None;
-        if let Some((mm_components, lookup_model_id, tokenizer_id, tokenizer_source, media_plan)) =
+        if let Some((mm_components, model_id, tokenizer_id, tokenizer_source, media_plan)) =
             mm_context
         {
             match multimodal::process_multimodal_plan(
                 media_plan,
-                lookup_model_id,
+                model_id,
                 &*tokenizer,
                 token_ids,
                 mm_components,
@@ -291,7 +290,7 @@ impl MessagePreparationStage {
         let preserve_reasoning_special_tokens = utils::reasoning_parser_requires_special_tokens(
             &ctx.components.reasoning_parser_factory,
             ctx.components.configured_reasoning_parser.as_deref(),
-            lookup_model_id,
+            model_id,
         );
 
         // Derive skip_special_tokens from parser and constraint type:

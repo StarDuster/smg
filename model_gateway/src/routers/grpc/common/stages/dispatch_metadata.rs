@@ -9,7 +9,7 @@ use tracing::error;
 use super::PipelineStage;
 use crate::routers::{
     error,
-    grpc::context::{DispatchMetadata, RequestContext, RequestType, WorkerSelection},
+    grpc::context::{DispatchMetadata, RequestContext, WorkerSelection},
 };
 
 /// Dispatch metadata stage: Prepare metadata for dispatch
@@ -27,19 +27,7 @@ impl PipelineStage for DispatchMetadataStage {
         })?;
 
         let request_id = execution_plan.request_id().to_string();
-        let model = match &ctx.input.request_type {
-            RequestType::Chat(req) => req.model.clone(),
-            RequestType::Completion(req) => req.model.clone(),
-            RequestType::Generate(_req) => {
-                // Generate requests don't have a model field
-                // Use model_id from input
-                ctx.input.model_id.clone()
-            }
-            RequestType::Responses(req) => req.model.clone(),
-            RequestType::Embedding(req) => req.model.clone(),
-            RequestType::Classify(req) => req.model.clone(),
-            RequestType::Messages(req) => req.model.clone(),
-        };
+        let model = ctx.input.model_id.clone();
 
         let weight_version = ctx
             .state
@@ -56,12 +44,9 @@ impl PipelineStage for DispatchMetadataStage {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs();
-        let canonical_model = ctx.canonical_model_id_arc();
-
         ctx.state.dispatch = Some(DispatchMetadata {
             request_id,
             model,
-            canonical_model,
             created,
             weight_version: Some(weight_version),
         });

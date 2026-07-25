@@ -231,7 +231,7 @@ impl ResponseProcessor {
             response_collection::collect_responses(execution_result, request_logprobs).await?;
 
         let history_tool_calls_count = utils::get_history_tool_calls_count(&chat_request);
-        let parser_model_id = dispatch.canonical_model_id();
+        let parser_model_id = dispatch.model.as_str();
 
         // Check parser availability once upfront (not per choice)
         let reasoning_parser_available = chat_request.separate_reasoning
@@ -522,7 +522,7 @@ impl ResponseProcessor {
         }
         #[expect(clippy::unwrap_used, reason = "safe: checked len == 1 above")]
         let complete = all_responses.into_iter().next().unwrap();
-        let parser_model_id = dispatch.canonical_model_id();
+        let parser_model_id = dispatch.model.as_str();
 
         // Check parser availability. Run parser when the user explicitly enabled thinking,
         // or when the selected parser needs structural special tokens (e.g. Inkling).

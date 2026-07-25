@@ -50,11 +50,8 @@ pub(crate) struct RequestContext {
 pub(crate) struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
-    /// Client-supplied model ID retained for errors, dispatch metadata, the
-    /// upstream request, and request-level metrics.
+    /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
-    /// Canonical model ID used for internal per-model lookups and selection metrics.
-    canonical_model_id: Option<Arc<str>>,
     pub tenant_request_meta: Option<TenantRequestMeta>,
 }
 
@@ -71,6 +68,23 @@ pub(crate) enum RequestType {
 }
 
 impl RequestType {
+    fn set_model(&mut self, model_id: &str) {
+        fn replace(model: &mut String, model_id: &str) {
+            model.clear();
+            model.push_str(model_id);
+        }
+
+        match self {
+            Self::Chat(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Generate(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Completion(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
+        }
+    }
+
     /// Client-supplied backend request id (`rid`), where the protocol carries
     /// one. Responses ids are storage-owned (`resp_*`) and never client-set.
     pub fn rid(&self) -> Option<&str> {
@@ -380,19 +394,9 @@ pub(crate) enum ClientSelection {
 #[derive(Clone)]
 pub(crate) struct DispatchMetadata {
     pub request_id: String,
-    /// Client-supplied model ID used in external responses and request metrics.
     pub model: String,
-    /// Canonical model ID used only for model-specific parser selection.
-    pub canonical_model: Option<Arc<str>>,
     pub created: u64,
     pub weight_version: Option<String>,
-}
-
-impl DispatchMetadata {
-    /// Return the model ID used for parser lookup without allocating.
-    pub fn canonical_model_id(&self) -> &str {
-        self.canonical_model.as_deref().unwrap_or(&self.model)
-    }
 }
 
 /// Load guards for worker load tracking
@@ -464,37 +468,27 @@ pub(crate) struct ResponseState {
 
 impl RequestContext {
     fn new(
-        request_type: RequestType,
+        mut request_type: RequestType,
         headers: Option<HeaderMap>,
-        model_id: String,
+        mut model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        let canonical_model_id = components.worker_registry.resolve_model_alias(&model_id);
+        if let Some(canonical_model_id) = components.worker_registry.resolve_model_alias(&model_id)
+        {
+            model_id.clear();
+            model_id.push_str(&canonical_model_id);
+            request_type.set_model(&model_id);
+        }
         Self {
             input: RequestInput {
                 request_type,
                 headers,
                 model_id,
-                canonical_model_id,
                 tenant_request_meta: None,
             },
             components,
             state: ProcessingState::default(),
         }
-    }
-
-    /// Return the canonical model ID for internal registries and configuration.
-    /// Unknown and wildcard names remain unchanged.
-    pub fn canonical_model_id(&self) -> &str {
-        self.input
-            .canonical_model_id
-            .as_deref()
-            .unwrap_or(&self.input.model_id)
-    }
-
-    /// Clone the resolved canonical model ID for state that outlives this context borrow.
-    pub fn canonical_model_id_arc(&self) -> Option<Arc<str>> {
-        self.input.canonical_model_id.clone()
     }
 
     /// Create context for chat completion request

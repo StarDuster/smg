@@ -319,6 +319,11 @@ mod pd_routing_tests {
             .unwrap();
         let alias_response = app.clone().oneshot(alias_request).await.unwrap();
         assert_eq!(alias_response.status(), StatusCode::OK);
+        let alias_body = to_bytes(alias_response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let alias_json: serde_json::Value = serde_json::from_slice(&alias_body).unwrap();
+        assert_eq!(alias_json["model"], CANONICAL_MODEL);
 
         let unknown_request = Request::builder()
             .method("POST")

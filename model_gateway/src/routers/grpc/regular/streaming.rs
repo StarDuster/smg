@@ -296,7 +296,7 @@ impl StreamingProcessor {
         // Use dispatch metadata for consistent response fields
         let request_id = &dispatch.request_id;
         let model = &dispatch.model;
-        let parser_model_id = dispatch.canonical_model_id();
+        let parser_model_id = dispatch.model.as_str();
         let created = dispatch.created;
         let system_fingerprint = dispatch.weight_version.as_deref();
 
@@ -1715,7 +1715,7 @@ impl StreamingProcessor {
 
         let request_id = &dispatch.request_id;
         let model = &dispatch.model;
-        let parser_model_id = dispatch.canonical_model_id();
+        let parser_model_id = dispatch.model.as_str();
 
         let has_tools = original_request.tools.is_some();
 

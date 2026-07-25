@@ -63,6 +63,7 @@ struct PDRequestContext<'a> {
     return_logprob: bool,
     request_text: Option<String>,
     model_id: &'a str,
+    rewrite_response_model: bool,
     headers: Option<HeaderMap>,
 }
 
@@ -286,12 +287,15 @@ impl PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
-        context: PDRequestContext<'_>,
+        mut context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
 
         let route = context.route;
-        let model = context.model_id;
+        let canonical_model = self.worker_registry.resolve_model_alias(context.model_id);
+        let model = canonical_model.as_deref().unwrap_or(context.model_id);
+        context.model_id = model;
+        context.rewrite_response_model = canonical_model.is_some();
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -346,6 +350,9 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        if let Some(request_model) = json_request.get_mut("model") {
+                            *request_model = Value::String(model.to_owned());
+                        }
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -527,6 +534,7 @@ impl PDRouter {
                 status,
                 None,
                 context.return_logprob,
+                None,
                 Some(decode_url),
                 Some(response_headers),
                 load_guards,
@@ -751,6 +759,9 @@ impl PDRouter {
                 status,
                 prefill_logprobs,
                 context.return_logprob,
+                context
+                    .rewrite_response_model
+                    .then(|| context.model_id.to_owned()),
                 None,
                 Some(response_headers),
                 load_guards,
@@ -763,6 +774,7 @@ impl PDRouter {
                     status,
                     context.return_logprob,
                     prefill_body,
+                    context.rewrite_response_model.then_some(context.model_id),
                 )
                 .await
             } else {
@@ -772,6 +784,11 @@ impl PDRouter {
 
                 match decode_response.bytes().await {
                     Ok(decode_body) => {
+                        let decode_body = if context.rewrite_response_model {
+                            Self::replace_response_model(decode_body, context.model_id)
+                        } else {
+                            decode_body
+                        };
                         let mut response = Response::new(Body::from(decode_body));
                         *response.status_mut() = status;
                         *response.headers_mut() = response_headers;
@@ -949,6 +966,7 @@ impl PDRouter {
         status: StatusCode,
         prefill_logprobs: Option<Value>,
         return_logprob: bool,
+        response_model: Option<String>,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
         load_guards: Vec<WorkerLoadGuard>,
@@ -977,9 +995,12 @@ impl PDRouter {
                             at_line_start = last == b'\n' || last == b'\r';
                         }
 
-                        let result = if return_logprob && prefill_logprobs.is_some() {
+                        let result = if (return_logprob && prefill_logprobs.is_some())
+                            || response_model.is_some()
+                        {
                             Self::merge_streaming_logprobs(
                                 prefill_logprobs.as_ref(),
+                                response_model.as_deref(),
                                 &chunk,
                                 &mut encoder,
                             )
@@ -1033,6 +1054,17 @@ impl PDRouter {
         response
     }
 
+    fn replace_response_model(body: Bytes, model: &str) -> Bytes {
+        let Ok(mut response) = serde_json::from_slice::<Value>(&body) else {
+            return body;
+        };
+        let Some(response_model) = response.get_mut("model") else {
+            return body;
+        };
+        *response_model = Value::String(model.to_owned());
+        serde_json::to_vec(&response).map_or(body, Bytes::from)
+    }
+
     // Helper to process non-streaming decode response with logprob merging
     async fn process_non_streaming_response(
         &self,
@@ -1040,6 +1072,7 @@ impl PDRouter {
         status: StatusCode,
         return_logprob: bool,
         prefill_body: Option<Bytes>,
+        response_model: Option<&str>,
     ) -> Response {
         let response = res.bytes().await;
         let decode_body = match response {
@@ -1050,24 +1083,31 @@ impl PDRouter {
             }
         };
 
-        if !return_logprob {
+        if !return_logprob && response_model.is_none() {
             return Self::non_stream_pd_json_response(status, decode_body);
         }
 
-        let Some(prefill_body) = prefill_body else {
+        let Ok(mut decode_json) = serde_json::from_slice::<Value>(&decode_body) else {
+            warn!("Failed to parse decode response");
             return Self::non_stream_pd_json_response(status, decode_body);
         };
 
-        // Merge logprobs from prefill and decode
-        let (Ok(prefill_json), Ok(mut decode_json)) = (
-            serde_json::from_slice::<Value>(&prefill_body),
-            serde_json::from_slice::<Value>(&decode_body),
-        ) else {
-            warn!("Failed to parse responses for logprob merging");
-            return Self::non_stream_pd_json_response(status, decode_body);
-        };
+        if let Some(model) = response_model {
+            if let Some(response_model) = decode_json.get_mut("model") {
+                *response_model = Value::String(model.to_owned());
+            }
+        }
 
-        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+        if return_logprob {
+            if let Some(prefill_body) = prefill_body {
+                match serde_json::from_slice::<Value>(&prefill_body) {
+                    Ok(prefill_json) => {
+                        Self::merge_logprobs_in_json(&prefill_json, &mut decode_json);
+                    }
+                    Err(_) => warn!("Failed to parse prefill response for logprob merging"),
+                }
+            }
+        }
 
         // Return merged response
         match serde_json::to_vec(&decode_json) {
@@ -1260,6 +1300,7 @@ impl PDRouter {
     // Optimized to reduce allocations in the merge path
     fn merge_streaming_logprobs(
         prefill_logprobs: Option<&Value>,
+        response_model: Option<&str>,
         decode_chunk: &[u8],
         encoder: &mut SseEncoder,
     ) -> Result<Bytes, ()> {
@@ -1277,6 +1318,12 @@ impl PDRouter {
             return Err(());
         }
         let mut decode_json: Value = serde_json::from_str(json_str).map_err(|_| ())?;
+
+        if let Some(model) = response_model {
+            if let Some(response_model) = decode_json.get_mut("model") {
+                *response_model = Value::String(model.to_owned());
+            }
+        }
 
         // Merge prefill logprobs if available
         if let Some(p_logprobs) = prefill_logprobs {
@@ -1425,6 +1472,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            rewrite_response_model: false,
             headers: headers.cloned(),
         };
 
@@ -1457,6 +1505,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            rewrite_response_model: false,
             headers: headers.cloned(),
         };
 
@@ -1492,6 +1541,7 @@ impl RouterTrait for PDRouter {
             return_logprob,
             request_text,
             model_id,
+            rewrite_response_model: false,
             headers: headers.cloned(),
         };
 
@@ -1519,6 +1569,7 @@ impl RouterTrait for PDRouter {
             return_logprob: false,
             request_text: req_text,
             model_id,
+            rewrite_response_model: false,
             headers: headers.cloned(),
         };
 
@@ -1629,10 +1680,12 @@ mod tests {
         let mut encoder = SseEncoder::new();
         // The exact sentinel is skipped (caller forwards it verbatim)
         assert!(
-            PDRouter::merge_streaming_logprobs(None, b"data: [DONE]\n\n", &mut encoder).is_err()
+            PDRouter::merge_streaming_logprobs(None, None, b"data: [DONE]\n\n", &mut encoder)
+                .is_err()
         );
         // A payload containing "[DONE]" as text is still processed
         assert!(PDRouter::merge_streaming_logprobs(
+            None,
             None,
             b"data: {\"text\":\"[DONE]\",\"meta_info\":{}}\n\n",
             &mut encoder
@@ -1790,6 +1843,7 @@ mod tests {
             return_logprob: false,
             request_text: None,
             model_id: UNKNOWN_MODEL_ID,
+            rewrite_response_model: false,
             headers: None,
         };
 
@@ -1864,6 +1918,7 @@ mod tests {
                 StatusCode::OK,
                 None,
                 false,
+                None,
                 None,
                 None,
                 guards,

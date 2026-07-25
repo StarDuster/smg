@@ -418,22 +418,20 @@ impl RequestPipeline {
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Response {
         let start = Instant::now();
-        // Clone Arc for metrics (cheap atomic increment) to avoid borrow issues
-        let request_for_metrics = Arc::clone(&request);
         let streaming = request.stream;
+        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        let model = ctx.input.model_id.clone();
 
         // Record request start
         Metrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            &request_for_metrics.model,
+            &model,
             metrics_labels::ENDPOINT_CHAT,
             bool_to_static_str(streaming),
         );
-
-        let mut ctx = RequestContext::for_chat(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -443,7 +441,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        &request_for_metrics.model,
+                        &model,
                         metrics_labels::ENDPOINT_CHAT,
                         start.elapsed(),
                     );
@@ -455,7 +453,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        &request_for_metrics.model,
+                        &model,
                         metrics_labels::ENDPOINT_CHAT,
                         error_type_from_status(response.status()),
                     );
@@ -475,7 +473,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    &request_for_metrics.model,
+                    &model,
                     metrics_labels::ENDPOINT_CHAT,
                     start.elapsed(),
                 );
@@ -491,14 +489,12 @@ impl RequestPipeline {
                 "execute_chat",
                 "Chat",
                 &response_type,
-                &request_for_metrics.model,
+                &model,
                 metrics_labels::ENDPOINT_CHAT,
             ),
-            None => self.no_response_produced(
-                "execute_chat",
-                &request_for_metrics.model,
-                metrics_labels::ENDPOINT_CHAT,
-            ),
+            None => {
+                self.no_response_produced("execute_chat", &model, metrics_labels::ENDPOINT_CHAT)
+            }
         }
     }
 
@@ -513,6 +509,9 @@ impl RequestPipeline {
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
+        let mut ctx = RequestContext::for_generate(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        let model_id = ctx.input.model_id.clone();
 
         // Record request start
         Metrics::record_router_request(
@@ -523,9 +522,6 @@ impl RequestPipeline {
             metrics_labels::ENDPOINT_GENERATE,
             bool_to_static_str(streaming),
         );
-
-        let mut ctx = RequestContext::for_generate(request, headers, model_id.clone(), components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -603,8 +599,10 @@ impl RequestPipeline {
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Response {
         let start = Instant::now();
-        let model = request.model.clone();
         let streaming = request.stream;
+        let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        let model = ctx.input.model_id.clone();
 
         Metrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
@@ -614,9 +612,6 @@ impl RequestPipeline {
             metrics_labels::ENDPOINT_COMPLETIONS,
             bool_to_static_str(streaming),
         );
-
-        let mut ctx = RequestContext::for_completion(request, headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -693,6 +688,9 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Response {
+        let mut ctx = RequestContext::for_embedding(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        let model_id = ctx.input.model_id.clone();
         debug!(
             "execute_embeddings: Starting execution for model: {}",
             &model_id
@@ -708,9 +706,6 @@ impl RequestPipeline {
             metrics_labels::ENDPOINT_EMBEDDINGS,
             bool_to_static_str(false),
         );
-
-        let mut ctx = RequestContext::for_embedding(request, headers, model_id.clone(), components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
 
         for stage in self.stages.iter() {
             debug!("execute_embeddings: Executing stage: {}", stage.name());
@@ -795,6 +790,9 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
     ) -> Response {
+        let mut ctx = RequestContext::for_classify(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        let model_id = ctx.input.model_id.clone();
         debug!(
             "execute_classify: Starting execution for model: {}",
             &model_id
@@ -810,9 +808,6 @@ impl RequestPipeline {
             metrics_labels::ENDPOINT_CLASSIFY,
             bool_to_static_str(false), // Classify is never streaming
         );
-
-        let mut ctx = RequestContext::for_classify(request, headers, model_id.clone(), components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
 
         for stage in self.stages.iter() {
             debug!("execute_classify: Executing stage: {}", stage.name());
@@ -899,19 +894,19 @@ impl RequestPipeline {
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream.unwrap_or(false);
+        let mut ctx = RequestContext::for_messages(request, headers, model_id, components);
+        ctx.input.tenant_request_meta = tenant_request_meta;
+        let model = ctx.input.model_id.clone();
 
         // Record request start
         Metrics::record_router_request(
             metrics_labels::ROUTER_GRPC,
             self.backend_type,
             metrics_labels::CONNECTION_GRPC,
-            &request.model,
+            &model,
             metrics_labels::ENDPOINT_MESSAGES,
             bool_to_static_str(streaming),
         );
-
-        let mut ctx = RequestContext::for_messages(request.clone(), headers, model_id, components);
-        ctx.input.tenant_request_meta = tenant_request_meta;
 
         for stage in self.stages.iter() {
             match stage.execute(&mut ctx).await {
@@ -921,7 +916,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        &request.model,
+                        &model,
                         metrics_labels::ENDPOINT_MESSAGES,
                         start.elapsed(),
                     );
@@ -933,7 +928,7 @@ impl RequestPipeline {
                         metrics_labels::ROUTER_GRPC,
                         self.backend_type,
                         metrics_labels::CONNECTION_GRPC,
-                        &request.model,
+                        &model,
                         metrics_labels::ENDPOINT_MESSAGES,
                         error_type_from_status(response.status()),
                     );
@@ -953,7 +948,7 @@ impl RequestPipeline {
                     metrics_labels::ROUTER_GRPC,
                     self.backend_type,
                     metrics_labels::CONNECTION_GRPC,
-                    &request.model,
+                    &model,
                     metrics_labels::ENDPOINT_MESSAGES,
                     start.elapsed(),
                 );
@@ -969,12 +964,12 @@ impl RequestPipeline {
                 "execute_messages",
                 "Messages",
                 &response_type,
-                &request.model,
+                &model,
                 metrics_labels::ENDPOINT_MESSAGES,
             ),
             None => self.no_response_produced(
                 "execute_messages",
-                &request.model,
+                &model,
                 metrics_labels::ENDPOINT_MESSAGES,
             ),
         }
@@ -1467,7 +1462,7 @@ mod alias_pipeline_tests {
     }
 
     #[tokio::test]
-    async fn pd_generate_alias_passes_preparation_before_worker_selection() {
+    async fn pd_generate_alias_is_canonical_before_preparation() {
         let worker_registry = Arc::new(WorkerRegistry::new());
         register_pd_worker(
             &worker_registry,
@@ -1509,8 +1504,8 @@ mod alias_pipeline_tests {
             components,
         );
 
-        assert_eq!(ctx.input.model_id, MODEL_ALIAS);
-        assert_eq!(ctx.canonical_model_id(), CANONICAL_MODEL);
+        assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
+        assert_eq!(ctx.generate_request().model, CANONICAL_MODEL);
 
         for stage in pipeline.stages.iter() {
             assert!(stage.execute(&mut ctx).await.unwrap().is_none());
@@ -1519,7 +1514,8 @@ mod alias_pipeline_tests {
             }
         }
 
-        assert_eq!(ctx.input.model_id, MODEL_ALIAS);
+        assert_eq!(ctx.input.model_id, CANONICAL_MODEL);
+        assert_eq!(ctx.generate_request().model, CANONICAL_MODEL);
         assert!(ctx.state.tokenizer.is_some());
         match ctx.state.workers.as_ref().unwrap() {
             WorkerSelection::Disaggregated {

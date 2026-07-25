@@ -62,22 +62,21 @@ pub(crate) fn resolve_tokenizer(
     ctx: &mut RequestContext,
     stage_name: &str,
 ) -> Result<Arc<dyn Tokenizer>, Box<Response>> {
-    let requested_model_id = ctx.input.model_id.as_str();
-    let tokenizer_model_id = ctx.canonical_model_id();
+    let model_id = ctx.input.model_id.as_str();
 
     let tokenizer = ctx
         .components
         .tokenizer_registry
-        .get(tokenizer_model_id)
+        .get(model_id)
         .ok_or_else(|| {
             error!(
                 function = %stage_name,
-                model = %requested_model_id,
+                model = %model_id,
                 "Tokenizer not found for model"
             );
             Box::new(error::internal_error(
                 "tokenizer_not_found",
-                format!("Tokenizer not found for model: {requested_model_id}"),
+                format!("Tokenizer not found for model: {model_id}"),
             ))
         })?;
 
