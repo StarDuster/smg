@@ -1200,4 +1200,32 @@ mod tests {
             assert_eq!(router.router_type(), "epd");
         }
     }
+
+    #[test]
+    fn weighted_routing_accepts_model_alias() {
+        let registry = Arc::new(WorkerRegistry::new());
+        for (url, worker_type) in [
+            ("http://prefill:8080", WorkerType::Prefill),
+            ("http://decode:8080", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Http)
+                .model(ModelCard::new("canonical-model").with_alias("model-alias"))
+                .circuit_breaker_config(CircuitBreakerConfig::default())
+                .build();
+            registry.register(Arc::new(worker)).unwrap();
+        }
+
+        let mut manager = RouterManager::new(registry, reqwest::Client::new());
+        manager.enable_igw = true;
+        let manager = Arc::new(manager);
+        manager.register_router(router_ids::HTTP_REGULAR, Arc::new(StubRouter));
+        manager.register_router(router_ids::HTTP_PD, Arc::new(PdStubRouter));
+
+        let router = manager
+            .select_router_for_request(Some("model-alias"))
+            .expect("alias should select the PD router");
+        assert_eq!(router.router_type(), "pd");
+    }
 }

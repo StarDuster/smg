@@ -32,7 +32,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard},
+    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
 /// Main request processing context
@@ -50,6 +50,7 @@ pub(crate) struct RequestContext {
 pub(crate) struct RequestInput {
     pub request_type: RequestType,
     pub headers: Option<HeaderMap>,
+    /// Canonical model ID used after aliases are resolved at request entry.
     pub model_id: String,
     pub tenant_request_meta: Option<TenantRequestMeta>,
 }
@@ -67,6 +68,29 @@ pub(crate) enum RequestType {
 }
 
 impl RequestType {
+    /// Overwrite the request's own `model` field.
+    ///
+    /// Callers hold the request behind an `Arc` that the retry loop also
+    /// holds, so `Arc::make_mut` copies the request here. That cost is paid
+    /// only on the alias path — [`RequestContext::new`] skips this call
+    /// entirely when the client already used the canonical model ID.
+    fn set_model(&mut self, model_id: &str) {
+        fn replace(model: &mut String, model_id: &str) {
+            model.clear();
+            model.push_str(model_id);
+        }
+
+        match self {
+            Self::Chat(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Generate(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Completion(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Responses(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Embedding(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Classify(request) => replace(&mut Arc::make_mut(request).model, model_id),
+            Self::Messages(request) => replace(&mut Arc::make_mut(request).model, model_id),
+        }
+    }
+
     /// Client-supplied backend request id (`rid`), where the protocol carries
     /// one. Responses ids are storage-owned (`resp_*`) and never client-set.
     pub fn rid(&self) -> Option<&str> {
@@ -112,6 +136,7 @@ impl std::fmt::Display for FinalResponse {
 /// Shared components (injected once at creation)
 pub(crate) struct SharedComponents {
     pub tokenizer_registry: Arc<TokenizerRegistry>,
+    pub worker_registry: Arc<WorkerRegistry>,
     pub tool_parser_factory: ToolParserFactory,
     pub reasoning_parser_factory: ReasoningParserFactory,
     /// Configured tool parser name (from CLI `--tool-call-parser`)
@@ -448,16 +473,32 @@ pub(crate) struct ResponseState {
 }
 
 impl RequestContext {
-    /// Create context for chat completion request
-    pub fn for_chat(
-        request: Arc<ChatCompletionRequest>,
+    /// Build a context, resolving a model alias to its canonical model ID.
+    ///
+    /// This is the single place the gRPC pipeline canonicalizes. Both
+    /// `input.model_id` and the request's own `model` field are rewritten, so
+    /// every stage below — worker selection, tokenizer lookup, parser
+    /// selection, tool call ID format — reads the canonical ID without
+    /// resolving anything itself.
+    ///
+    /// One visible consequence: the response reports the canonical model ID,
+    /// not the alias the client sent. That matches how the OpenAI API answers
+    /// with the model it actually ran.
+    fn new(
+        mut request_type: RequestType,
         headers: Option<HeaderMap>,
-        model_id: String,
+        mut model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
+        if let Some(canonical_model_id) = components.worker_registry.resolve_model_alias(&model_id)
+        {
+            model_id.clear();
+            model_id.push_str(&canonical_model_id);
+            request_type.set_model(&model_id);
+        }
         Self {
             input: RequestInput {
-                request_type: RequestType::Chat(request),
+                request_type,
                 headers,
                 model_id,
                 tenant_request_meta: None,
@@ -465,6 +506,16 @@ impl RequestContext {
             components,
             state: ProcessingState::default(),
         }
+    }
+
+    /// Create context for chat completion request
+    pub fn for_chat(
+        request: Arc<ChatCompletionRequest>,
+        headers: Option<HeaderMap>,
+        model_id: String,
+        components: Arc<SharedComponents>,
+    ) -> Self {
+        Self::new(RequestType::Chat(request), headers, model_id, components)
     }
 
     /// Create context for generate request
@@ -474,16 +525,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Generate(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Generate(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for completion request
@@ -493,16 +540,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Completion(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Completion(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for Responses API request
@@ -512,16 +555,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Responses(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Responses(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for embedding request
@@ -531,16 +570,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Embedding(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Embedding(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for classify request
@@ -550,16 +585,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Classify(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Classify(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Create context for messages request
@@ -569,16 +600,12 @@ impl RequestContext {
         model_id: String,
         components: Arc<SharedComponents>,
     ) -> Self {
-        Self {
-            input: RequestInput {
-                request_type: RequestType::Messages(request),
-                headers,
-                model_id,
-                tenant_request_meta: None,
-            },
+        Self::new(
+            RequestType::Messages(request),
+            headers,
+            model_id,
             components,
-            state: ProcessingState::default(),
-        }
+        )
     }
 
     /// Get chat request (panics if not chat)

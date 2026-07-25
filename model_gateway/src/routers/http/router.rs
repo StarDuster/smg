@@ -247,6 +247,12 @@ impl Router {
         let start = Instant::now();
         let is_stream = typed_req.is_stream();
         let text = typed_req.extract_text_for_routing();
+        // Resolve once, here, so every registry, policy and metrics lookup
+        // below is keyed by the canonical model ID. Only `get_by_model`
+        // understands aliases; retry configs, hash rings and policies do not,
+        // and an alias would silently fall back to router defaults.
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
         let model = model_id;
         let endpoint = route_to_endpoint(route);
 
@@ -271,7 +277,15 @@ impl Router {
             // operation per attempt
             |_: u32| async {
                 let res = self
-                    .route_typed_request_once(headers, typed_req, route, model_id, is_stream, &text)
+                    .route_typed_request_once(
+                        headers,
+                        typed_req,
+                        route,
+                        model_id,
+                        canonical_model.as_deref(),
+                        is_stream,
+                        &text,
+                    )
                     .await;
 
                 // Need to be outside `route_typed_request_once` because that function has multiple return paths
@@ -322,12 +336,17 @@ impl Router {
         response
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-attempt state threaded from route_typed_request; a struct would only move the arity"
+    )]
     async fn route_typed_request_once<T: GenerationRequest + serde::Serialize + Clone>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
         model_id: &str,
+        canonical_model: Option<&str>,
         is_stream: bool,
         text: &str,
     ) -> Response {
@@ -375,6 +394,7 @@ impl Router {
                 headers,
                 typed_req,
                 route,
+                canonical_model,
                 worker.as_ref(),
                 is_stream,
                 load_guard,
@@ -524,6 +544,13 @@ impl Router {
         let start = Instant::now();
         let is_stream = body.is_stream();
         let text = body.extract_text_for_routing();
+        // Resolve once, here, for the same reason as `route_typed_request`:
+        // only `get_by_model` understands aliases, so the policy and hash ring
+        // lookups below would silently fall back to router defaults on an
+        // alias. This path cannot reuse that resolution because multipart
+        // never goes through `route_typed_request`.
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
         let endpoint = route_to_endpoint(route);
 
         Metrics::record_router_request(
@@ -648,7 +675,7 @@ impl Router {
 
         events::RequestSentEvent { url: worker.url() }.emit();
 
-        let form = match build_transcription_form(body, audio) {
+        let form = match build_transcription_form(body, audio, canonical_model.as_deref()) {
             Ok(f) => f,
             Err(e) => {
                 let resp = error::bad_request("multipart_build_failed", e);
@@ -877,12 +904,21 @@ impl Router {
         response
     }
 
-    // Send typed request directly without conversion
+    // Send typed request directly without conversion.
+    //
+    // `canonical_model` is set only when the client addressed the model by an
+    // alias. The worker was registered under the canonical ID and has never
+    // heard of the alias, so the body it receives carries the canonical name.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "per-request state threaded from route_typed_request_once; a struct would only move the arity"
+    )]
     async fn send_typed_request<T: serde::Serialize>(
         &self,
         headers: Option<&HeaderMap>,
         typed_req: &T,
         route: &'static str,
+        canonical_model: Option<&str>,
         worker: &dyn Worker,
         is_stream: bool,
         load_guard: Option<WorkerLoadGuard>,
@@ -890,7 +926,7 @@ impl Router {
         let api_key = worker.api_key().cloned();
         let endpoint_url = worker.endpoint_url(route);
 
-        let json_val = match serde_json::to_value(typed_req) {
+        let mut json_val = match serde_json::to_value(typed_req) {
             Ok(j) => j,
             Err(e) => {
                 return error::bad_request(
@@ -899,6 +935,10 @@ impl Router {
                 );
             }
         };
+
+        if let Some(canonical_model) = canonical_model {
+            super::set_request_model(&mut json_val, canonical_model);
+        }
 
         let mut json_val = match worker.prepare_request(json_val) {
             Ok(prepared) => prepared,
@@ -1012,15 +1052,23 @@ impl Router {
         }
     }
 
+    /// Build the public rerank response.
+    ///
+    /// Rerank is the one HTTP route whose response the gateway constructs
+    /// itself instead of passing the worker's through, so the model it reports
+    /// has to be canonicalized here. `canonical_model` is set only when the
+    /// client addressed the model by an alias; reporting the alias would make
+    /// this route disagree with every other one about which model ran.
     async fn build_rerank_response(
         req: &RerankRequest,
+        canonical_model: Option<&str>,
         response: Response,
     ) -> anyhow::Result<Response> {
         let (_, response_body) = response.into_parts();
         let body_bytes = to_bytes(response_body, usize::MAX).await?;
         let rerank_results = serde_json::from_slice::<Vec<RerankResult>>(&body_bytes)?;
-        let mut rerank_response =
-            RerankResponse::new(rerank_results, req.model.clone(), req.rid.clone());
+        let model = canonical_model.map_or_else(|| req.model.clone(), ToOwned::to_owned);
+        let mut rerank_response = RerankResponse::new(rerank_results, model, req.rid.clone());
         // Sorting is handled by Python worker (serving_rerank.py)
         if let Some(top_k) = req.top_k {
             rerank_response.apply_top_k(top_k);
@@ -1032,7 +1080,16 @@ impl Router {
     }
 }
 
-fn build_transcription_form(body: &TranscriptionRequest, audio: AudioFile) -> Result<Form, String> {
+/// Build the multipart body forwarded to the worker.
+///
+/// `canonical_model` is set only when the client addressed the model by an
+/// alias. The worker was registered under the canonical ID and has never heard
+/// of the alias, so that is the name the form carries.
+fn build_transcription_form(
+    body: &TranscriptionRequest,
+    audio: AudioFile,
+    canonical_model: Option<&str>,
+) -> Result<Form, String> {
     let AudioFile {
         bytes,
         file_name,
@@ -1050,9 +1107,10 @@ fn build_transcription_form(body: &TranscriptionRequest, audio: AudioFile) -> Re
             .map_err(|e| format!("Invalid audio content-type '{ct}': {e}"))?;
     }
 
-    let mut form = Form::new()
-        .part("file", file_part)
-        .text("model", body.model.clone());
+    let mut form = Form::new().part("file", file_part).text(
+        "model",
+        canonical_model.map_or_else(|| body.model.clone(), ToOwned::to_owned),
+    );
 
     if let Some(ref language) = body.language {
         form = form.text("language", language.clone());
@@ -1257,11 +1315,12 @@ impl RouterTrait for Router {
         body: &RerankRequest,
         model_id: &str,
     ) -> Response {
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
         let response = self
             .route_typed_request(headers, body, "/v1/rerank", model_id)
             .await;
         if response.status().is_success() {
-            match Self::build_rerank_response(body, response).await {
+            match Self::build_rerank_response(body, canonical_model.as_deref(), response).await {
                 Ok(rerank_response) => rerank_response,
                 Err(e) => {
                     error!("Failed to build rerank response: {}", e);

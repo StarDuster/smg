@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{borrow::Cow, sync::Arc};
 
 use async_trait::async_trait;
 use axum::{
@@ -348,6 +348,7 @@ impl GrpcRouter {
         // Create shared components for pipeline
         let shared_components = Arc::new(SharedComponents {
             tokenizer_registry: tokenizer_registry.clone(),
+            worker_registry: worker_registry.clone(),
             tool_parser_factory: tool_parser_factory.clone(),
             reasoning_parser_factory: reasoning_parser_factory.clone(),
             configured_tool_parser: ctx.configured_tool_parser.clone(),
@@ -437,7 +438,14 @@ impl GrpcRouter {
     /// The per-model retry override registered by a worker, else the router
     /// default. Applied at every retrying endpoint
     /// (chat/generate/messages/completion) in every mode.
+    ///
+    /// Resolves the alias itself. Retry overrides are keyed by canonical model
+    /// ID, and this runs before the pipeline canonicalizes in
+    /// `RequestContext::new`, so an alias would miss the override and fall
+    /// back to the router default without saying so.
     fn resolve_retry_config(&self, model_id: &str) -> RetryConfig {
+        let canonical_model = self.worker_registry.resolve_model_alias(model_id);
+        let model_id = canonical_model.as_deref().unwrap_or(model_id);
         self.worker_registry
             .get_retry_config(model_id)
             .unwrap_or_else(|| self.retry_config.clone())
@@ -612,6 +620,10 @@ impl GrpcRouter {
             return error_response;
         }
 
+        let (body, canonical_model_id) =
+            canonicalize_responses_request(&self.worker_registry, body, model_id);
+        let model_id = canonical_model_id.as_ref();
+
         // Choose implementation based on Harmony model detection (checks worker metadata)
         let is_harmony =
             HarmonyDetector::is_harmony_model_in_registry(&self.worker_registry, &body.model);
@@ -634,10 +646,11 @@ impl GrpcRouter {
             );
 
             if body.stream.unwrap_or(false) {
-                serve_harmony_responses_stream(&harmony_ctx, body.clone(), tenant_meta.clone())
+                serve_harmony_responses_stream(&harmony_ctx, body.into_owned(), tenant_meta.clone())
                     .await
             } else {
-                match serve_harmony_responses(&harmony_ctx, body.clone(), tenant_meta.clone()).await
+                match serve_harmony_responses(&harmony_ctx, body.into_owned(), tenant_meta.clone())
+                    .await
                 {
                     Ok(response) => axum::Json(response).into_response(),
                     Err(error_response) => error_response,
@@ -646,7 +659,7 @@ impl GrpcRouter {
         } else {
             responses::route_responses(
                 responses_context,
-                Arc::new(body.clone()),
+                Arc::new(body.into_owned()),
                 headers.cloned(),
                 tenant_meta.clone(),
                 model_id.to_string(),
@@ -1007,6 +1020,34 @@ impl RouterTrait for GrpcRouter {
     }
 }
 
+/// Resolve a Responses request's model alias, for both the routing decisions
+/// and the request the Responses layer will read.
+///
+/// The Responses layer builds its SSE events and its tool call responses from
+/// the request rather than from the pipeline context, so the alias has to be
+/// gone before dispatch. Otherwise a plain answer reports the canonical ID
+/// while a tool call answer reports the alias.
+///
+/// Returns both halves together so a caller cannot take the canonical model ID
+/// and forget the body, or the reverse. The common path borrows both untouched
+/// and allocates nothing.
+fn canonicalize_responses_request<'a>(
+    worker_registry: &WorkerRegistry,
+    body: &'a ResponsesRequest,
+    model_id: &'a str,
+) -> (Cow<'a, ResponsesRequest>, Cow<'a, str>) {
+    let Some(canonical_model) = worker_registry.resolve_model_alias(model_id) else {
+        return (Cow::Borrowed(body), Cow::Borrowed(model_id));
+    };
+    let mut canonical_body = body.clone();
+    canonical_body.model.clear();
+    canonical_body.model.push_str(&canonical_model);
+    (
+        Cow::Owned(canonical_body),
+        Cow::Owned(canonical_model.to_string()),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use axum::http::StatusCode;
@@ -1198,6 +1239,7 @@ mod pd_tests {
     use std::sync::{Arc, OnceLock};
 
     use llm_tokenizer::registry::TokenizerRegistry;
+    use openai_protocol::{model_card::ModelCard, worker::HealthCheckConfig};
     use reasoning_parser::ParserFactory as ReasoningParserFactory;
     use smg_data_connector::{
         MemoryConversationItemStorage, MemoryConversationStorage, MemoryResponseStorage,
@@ -1210,7 +1252,7 @@ mod pd_tests {
         config::{PolicyConfig, RouterConfig, RoutingMode},
         policies::PolicyRegistry,
         tenant::TenantKey,
-        worker::WorkerRegistry,
+        worker::{BasicWorkerBuilder, WorkerRegistry},
     };
 
     fn pd_routing_mode() -> RoutingMode {
@@ -1343,5 +1385,102 @@ mod pd_tests {
 
         let cancel = router.cancel_response(None, "resp_missing").await;
         assert_eq!(cancel.status(), StatusCode::NOT_IMPLEMENTED);
+    }
+
+    /// A Responses request addressed to an alias must reach the Responses
+    /// layer under the canonical model ID. That layer builds its SSE events
+    /// and tool-call responses from this request rather than from the pipeline
+    /// context, so leaving the alias here is what made the streaming and
+    /// tool-call paths disagree with the plain-answer path about which model
+    /// ran.
+    #[tokio::test]
+    async fn responses_request_is_canonical_before_the_responses_layer_sees_it() {
+        let ctx = grpc_ctx(pd_routing_mode()).await;
+        for (url, worker_type) in [
+            ("grpc://prefill:30000", WorkerType::Prefill),
+            ("grpc://decode:30000", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .model(ModelCard::new("canonical-model").with_alias("model-alias"))
+                .health_config(HealthCheckConfig {
+                    disable_health_check: true,
+                    ..Default::default()
+                })
+                .build();
+            ctx.worker_registry
+                .register(Arc::new(worker))
+                .expect("register worker");
+        }
+
+        let request = responses_request("model-alias");
+        let (body, model_id) =
+            canonicalize_responses_request(&ctx.worker_registry, &request, "model-alias");
+        assert_eq!(
+            body.model, "canonical-model",
+            "the Responses layer must see the canonical model ID"
+        );
+        assert_eq!(
+            model_id, "canonical-model",
+            "worker selection must use the canonical model ID"
+        );
+
+        // The canonical ID is left alone, and costs no copy.
+        let already_canonical = responses_request("canonical-model");
+        let (body, model_id) = canonicalize_responses_request(
+            &ctx.worker_registry,
+            &already_canonical,
+            "canonical-model",
+        );
+        assert!(matches!(body, Cow::Borrowed(_)));
+        assert!(matches!(model_id, Cow::Borrowed(_)));
+    }
+
+    /// A per-model retry override must survive an alias. The override is keyed
+    /// by canonical model ID and is read before the pipeline canonicalizes, so
+    /// without its own resolution an alias silently falls back to the router
+    /// default.
+    #[tokio::test]
+    async fn retry_override_survives_a_model_alias() {
+        let ctx = grpc_ctx(pd_routing_mode()).await;
+        let worker = BasicWorkerBuilder::new("grpc://decode:30000")
+            .worker_type(WorkerType::Decode)
+            .connection_mode(ConnectionMode::Grpc)
+            .model(ModelCard::new("canonical-model").with_alias("model-alias"))
+            .health_config(HealthCheckConfig {
+                disable_health_check: true,
+                ..Default::default()
+            })
+            .build();
+        ctx.worker_registry
+            .register(Arc::new(worker))
+            .expect("register worker");
+
+        let router = GrpcRouter::new(&ctx, Mode::PrefillDecode).expect("pd router");
+        let default_retries = router.retry_config.max_retries;
+        let override_retries = default_retries + 7;
+        ctx.worker_registry.set_model_retry_config(
+            "canonical-model",
+            RetryConfig {
+                max_retries: override_retries,
+                ..RetryConfig::default()
+            },
+            true,
+        );
+
+        assert_eq!(
+            router.resolve_retry_config("canonical-model").max_retries,
+            override_retries
+        );
+        assert_eq!(
+            router.resolve_retry_config("model-alias").max_retries,
+            override_retries,
+            "an aliased request must get the same retry override as the canonical ID"
+        );
+        assert_eq!(
+            router.resolve_retry_config("unrelated-model").max_retries,
+            default_retries
+        );
     }
 }

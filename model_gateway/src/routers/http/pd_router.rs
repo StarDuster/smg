@@ -286,12 +286,17 @@ impl PDRouter {
         &self,
         headers: Option<&HeaderMap>,
         original_request: &T,
-        context: PDRequestContext<'_>,
+        mut context: PDRequestContext<'_>,
     ) -> Response {
         let start_time = Instant::now();
 
         let route = context.route;
-        let model = context.model_id;
+        // Resolve once, here, so every registry, policy and metrics lookup
+        // below is keyed by the canonical model ID. Only `get_by_model`
+        // understands aliases; retry configs, hash rings and policies do not.
+        let canonical_model = self.worker_registry.resolve_model_alias(context.model_id);
+        let model = canonical_model.as_deref().unwrap_or(context.model_id);
+        context.model_id = model;
         let endpoint = route_to_endpoint(route);
 
         // Record request start (Layer 2)
@@ -346,6 +351,10 @@ impl PDRouter {
                             Ok(v) => v,
                             Err(e) => return Self::handle_serialization_error(e),
                         };
+                        // The prefill and decode workers only know the
+                        // canonical name, so forward that, not the alias the
+                        // client sent.
+                        super::set_request_model(&mut json_request, model);
 
                         json_request = match Self::inject_bootstrap_into_value(
                             json_request,
@@ -1532,6 +1541,8 @@ impl RouterTrait for PDRouter {
 
 #[cfg(test)]
 mod tests {
+    use openai_protocol::model_card::ModelCard;
+
     use super::*;
     use crate::{
         config::PolicyConfig,
@@ -1694,6 +1705,34 @@ mod tests {
 
         assert_eq!(prefill.url(), "http://healthy");
         assert!(prefill.is_healthy());
+    }
+
+    #[tokio::test]
+    async fn test_select_pd_pair_accepts_model_alias() {
+        let router = create_test_pd_router();
+        for (url, worker_type) in [
+            ("http://prefill", WorkerType::Prefill),
+            ("http://decode", WorkerType::Decode),
+        ] {
+            let worker = BasicWorkerBuilder::new(url)
+                .worker_type(worker_type)
+                .model(ModelCard::new("GLM-5.2").with_alias("GLM-5.2-Coding"))
+                .build();
+            worker.set_status(openai_protocol::worker::WorkerStatus::Ready);
+            router.worker_registry.register(Arc::new(worker)).unwrap();
+        }
+
+        let (prefill, decode) = router
+            .select_pd_pair(None, "GLM-5.2-Coding", None)
+            .await
+            .expect("alias should select a PD pair");
+        assert_eq!(prefill.url(), "http://prefill");
+        assert_eq!(decode.url(), "http://decode");
+
+        assert!(router
+            .select_pd_pair(None, "GLM-5.2-Unknown", None)
+            .await
+            .is_err());
     }
 
     #[tokio::test]

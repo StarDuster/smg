@@ -27,14 +27,16 @@ impl PipelineStage for DispatchMetadataStage {
         })?;
 
         let request_id = execution_plan.request_id().to_string();
+        // The model the response reports. `RequestContext::new` already
+        // rewrote every one of these to the canonical model ID, so a request
+        // that arrived under an alias is answered under the canonical name.
         let model = match &ctx.input.request_type {
             RequestType::Chat(req) => req.model.clone(),
             RequestType::Completion(req) => req.model.clone(),
-            RequestType::Generate(_req) => {
-                // Generate requests don't have a model field
-                // Use model_id from input
-                ctx.input.model_id.clone()
-            }
+            // `GenerateRequest` carries a model field too, but callers of the
+            // native `/generate` route may leave it empty, so prefer the
+            // model the router resolved.
+            RequestType::Generate(_req) => ctx.input.model_id.clone(),
             RequestType::Responses(req) => req.model.clone(),
             RequestType::Embedding(req) => req.model.clone(),
             RequestType::Classify(req) => req.model.clone(),

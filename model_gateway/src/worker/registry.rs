@@ -30,7 +30,7 @@ use crate::{
         event::WorkerEvent,
         hash_ring::HashRing,
         worker::{RuntimeType, WorkerType},
-        ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL,
+        ConnectionMode, Worker, DEFAULT_SAMPLING_PARAMS_LABEL, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -84,6 +84,9 @@ pub struct WorkerDescriptor {
 /// Updates create new snapshots (copy-on-write semantics).
 type ModelIndex = Arc<DashMap<String, Arc<[Arc<dyn Worker>]>>>;
 
+/// Model alias to canonical model ID.
+type ModelAliasIndex = Arc<DashMap<String, Arc<str>>>;
+
 /// Worker registry with model-based indexing
 #[derive(Debug)]
 pub struct WorkerRegistry {
@@ -93,6 +96,15 @@ pub struct WorkerRegistry {
     /// Model index for O(1) lookups using immutable snapshots.
     /// Uses Arc<[T]> instead of Arc<RwLock<Vec<T>>> for lock-free reads.
     model_index: ModelIndex,
+
+    /// Alias index kept separate from `model_index` so aliases do not appear as
+    /// models in discovery or statistics.
+    ///
+    /// Lock order: code that holds an entry of this map may then take a
+    /// `model_index` lock, never the reverse. Every alias write below reads
+    /// `model_index` while holding its own entry, so taking them in the other
+    /// order somewhere else would deadlock.
+    model_alias_index: ModelAliasIndex,
 
     /// Consistent hash rings per model for O(log n) routing.
     /// Rebuilt on worker add/remove (copy-on-write).
@@ -139,6 +151,7 @@ impl WorkerRegistry {
         Self {
             workers: Arc::new(DashMap::new()),
             model_index: Arc::new(DashMap::new()),
+            model_alias_index: Arc::new(DashMap::new()),
             hash_rings: Arc::new(DashMap::new()),
             type_workers: Arc::new(DashMap::new()),
             connection_workers: Arc::new(DashMap::new()),
@@ -268,6 +281,11 @@ impl WorkerRegistry {
     /// Returns `Some(ring)` if any workers are registered for this model,
     /// `None` otherwise. The ring is pre-built and updated on worker add
     /// or remove, so reads are allocation-free apart from the Arc clone.
+    ///
+    /// Keyed by canonical model ID only, like every other per-model map on
+    /// this registry except [`Self::get_by_model`]. A caller holding a
+    /// client-supplied name resolves it with [`Self::resolve_model_alias`]
+    /// once at request entry and passes the canonical ID from there on.
     pub fn get_hash_ring(&self, model_id: &str) -> Option<Arc<HashRing>> {
         self.hash_rings.get(model_id).map(|r| Arc::clone(&r))
     }
@@ -279,17 +297,59 @@ impl WorkerRegistry {
     /// Empty worker slice constant returned when a lookup has no matches.
     const EMPTY_WORKERS: &'static [Arc<dyn Worker>] = &[];
 
-    /// Return all workers serving a model as an immutable shared slice.
+    /// Return all workers serving a canonical model or alias.
     ///
     /// This is the fastest possible read path: the model index already
     /// stores the slice as an `Arc<[_]>`, so the return value is just an
     /// atomic refcount bump with zero contention. Returns an empty shared
     /// slice when the model is unknown.
     pub fn get_by_model(&self, model_id: &str) -> Arc<[Arc<dyn Worker>]> {
-        self.model_index
+        if let Some(workers) = self.model_index.get(model_id) {
+            return Arc::clone(&workers);
+        }
+        self.model_alias_index
             .get(model_id)
-            .map(|workers| Arc::clone(&workers))
+            .and_then(|canonical_id| {
+                self.model_index
+                    .get(canonical_id.as_ref())
+                    .map(|workers| Arc::clone(&workers))
+            })
             .unwrap_or_else(|| Arc::from(Self::EMPTY_WORKERS))
+    }
+
+    /// Resolve an alias to its canonical model ID without copying the string.
+    ///
+    /// Returns `None` for canonical model IDs, the `unknown` wildcard, and
+    /// unknown names. Callers can use the original input when this returns
+    /// `None`.
+    ///
+    /// # Rewriting an outbound request with the result
+    ///
+    /// Safe only where the alias is a second name for the same model, which is
+    /// what a self-hosted worker declares. It is NOT safe for external
+    /// providers: `workflow::steps::external::discover_models` groups a
+    /// provider's date-stamped variants under the shortest name, so `gpt-4o`
+    /// becomes canonical and `gpt-4o-2024-08-06` becomes its alias. Those name
+    /// different models — one floats to the provider's current release, the
+    /// other is pinned — and substituting one for the other would silently run
+    /// a model the client did not ask for.
+    ///
+    /// External workers reach only the OpenAI, Anthropic and Gemini routers
+    /// ([`RouterManager::select_router_for_workers`] gives them priority, and
+    /// single-router mode picks by routing mode), none of which rewrite the
+    /// outbound model. Keep it that way: canonicalize registry lookups there
+    /// if needed, never the request body.
+    ///
+    /// [`RouterManager::select_router_for_workers`]: crate::routers::RouterManager
+    pub fn resolve_model_alias(&self, model_id: &str) -> Option<Arc<str>> {
+        if model_id == UNKNOWN_MODEL_ID || self.model_index.contains_key(model_id) {
+            return None;
+        }
+
+        let canonical_id = self.model_alias_index.get(model_id)?;
+        self.model_index
+            .contains_key(canonical_id.as_ref())
+            .then(|| Arc::clone(&canonical_id))
     }
 
     /// Return all workers of a given type as an immutable shared slice.
@@ -472,6 +532,28 @@ impl WorkerRegistry {
             .filter(|entry| !entry.value().is_empty())
             .map(|entry| entry.key().clone())
             .collect()
+    }
+
+    /// Whether at least one worker serves this name, as a canonical model ID
+    /// or as an alias.
+    ///
+    /// [`Self::get_models`] lists canonical IDs only, so a membership test
+    /// written against it rejects every alias. Endpoints that gate on "is
+    /// this model servable" use this instead. The `unknown` wildcard is not a
+    /// registered name and stays rejected.
+    pub fn contains_model(&self, model_id: &str) -> bool {
+        if self.model_has_workers(model_id) {
+            return true;
+        }
+        self.model_alias_index
+            .get(model_id)
+            .is_some_and(|canonical_id| self.model_has_workers(canonical_id.as_ref()))
+    }
+
+    fn model_has_workers(&self, canonical_id: &str) -> bool {
+        self.model_index
+            .get(canonical_id)
+            .is_some_and(|workers| !workers.is_empty())
     }
 
     /// Return the number of registered workers.
@@ -747,11 +829,25 @@ impl WorkerRegistry {
         for added_model in new_models.difference(&old_models) {
             self.add_worker_to_model_index(added_model, new_worker.clone());
             self.rebuild_hash_ring(added_model);
+            self.drop_alias_shadowed_by_model(added_model);
         }
         // For models that stayed the same, update the worker reference in the index
         for kept_model in old_models.intersection(&new_models) {
             self.add_worker_to_model_index(kept_model, new_worker.clone());
             self.rebuild_hash_ring(kept_model);
+        }
+
+        // Update aliases after canonical indexes so alias removal can inspect
+        // the final worker set for each canonical model.
+        for model in old_worker.models() {
+            for alias in model.aliases {
+                self.remove_model_alias_if_unused(&alias, &model.id);
+            }
+        }
+        for model in new_worker.models() {
+            for alias in model.aliases {
+                self.add_model_alias(&alias, &model.id);
+            }
         }
 
         self.warn_on_sampling_defaults_divergence_for_worker(&new_worker);
@@ -983,6 +1079,11 @@ impl WorkerRegistry {
                     self.model_retry_configs.remove(&model_id);
                 }
             }
+            for model in worker.models() {
+                for alias in model.aliases {
+                    self.remove_model_alias_if_unused(&alias, &model.id);
+                }
+            }
             if let Some(mut type_workers) = self.type_workers.get_mut(worker.worker_type()) {
                 type_workers.retain(|id| id != worker_id);
             }
@@ -1203,6 +1304,15 @@ impl WorkerRegistry {
         for model_id in Self::worker_model_ids(&worker) {
             self.add_worker_to_model_index(&model_id, worker.clone());
             self.rebuild_hash_ring(&model_id);
+            // Run after the model index so `add_model_alias` below sees the
+            // model IDs this worker just contributed, and never while an index
+            // entry is held (see the lock order on `model_alias_index`).
+            self.drop_alias_shadowed_by_model(&model_id);
+        }
+        for model in worker.models() {
+            for alias in model.aliases {
+                self.add_model_alias(&alias, &model.id);
+            }
         }
         self.warn_on_sampling_defaults_divergence_for_worker(&worker);
 
@@ -1283,6 +1393,144 @@ impl WorkerRegistry {
         }
 
         self.rebuild_hash_ring(model_id);
+    }
+
+    fn add_model_alias(&self, alias: &str, canonical_id: &str) {
+        if alias == canonical_id {
+            return;
+        }
+        if alias == UNKNOWN_MODEL_ID {
+            tracing::warn!(
+                alias,
+                canonical_id,
+                "Ignoring model alias reserved for wildcard routing"
+            );
+            return;
+        }
+        // A name is either a canonical model ID or an alias, never both.
+        // Registered models win, so the alias is dropped rather than kept as a
+        // shadow that would take over once the model's last worker leaves.
+        //
+        // The collision check runs while the alias entry is held (alias
+        // before model, per the lock order on `model_alias_index`). Checked
+        // before taking the entry, a concurrent registration of a model
+        // named `alias` could slip between the check and the insert, run its
+        // `drop_alias_shadowed_by_model` against a still-absent entry, and
+        // leave the alias inserted here in place. Holding the entry makes
+        // that cleanup wait until the insert is visible.
+        let entry = self.model_alias_index.entry(alias.to_string());
+        if self.model_index.contains_key(alias) {
+            tracing::warn!(
+                alias,
+                canonical_id,
+                "Ignoring model alias that collides with a registered model ID"
+            );
+            // An occupied entry here is stale: the invariant above says the
+            // name cannot be both. Remove it instead of leaving it to take
+            // over once the model's last worker leaves.
+            if let Entry::Occupied(entry) = entry {
+                entry.remove();
+            }
+            return;
+        }
+
+        match entry {
+            Entry::Occupied(entry) if entry.get().as_ref() != canonical_id => tracing::warn!(
+                alias,
+                existing_canonical_id = entry.get().as_ref(),
+                ignored_canonical_id = canonical_id,
+                "Model alias already maps to a different canonical model"
+            ),
+            Entry::Occupied(_) => {}
+            Entry::Vacant(entry) => {
+                entry.insert(Arc::from(canonical_id));
+            }
+        }
+    }
+
+    /// Drop an alias entry that a newly registered model ID now shadows.
+    ///
+    /// Registration order decides which of the two arrives first, so the
+    /// collision has to be resolved from both sides: [`Self::add_model_alias`]
+    /// refuses an alias that names an existing model, and this refuses to keep
+    /// an existing alias that a new model now names.
+    fn drop_alias_shadowed_by_model(&self, model_id: &str) {
+        if let Some((alias, shadowed_canonical_id)) = self.model_alias_index.remove(model_id) {
+            tracing::warn!(
+                alias,
+                shadowed_canonical_id = shadowed_canonical_id.as_ref(),
+                "Dropping model alias that collides with a registered model ID"
+            );
+        }
+    }
+
+    /// Release `canonical_id`'s claim on `alias` after its declaring workers
+    /// are gone.
+    ///
+    /// Two models may declare the same alias; [`Self::add_model_alias`] keeps
+    /// whichever registered first and warns about the rest. Deleting the alias
+    /// outright when that winner leaves would strand the losers, which still
+    /// advertise it, so the alias is handed to a remaining model that declares
+    /// it and only deleted when none does.
+    ///
+    /// Holds the alias entry across the whole decision. Checking outside the
+    /// entry would let a concurrent registration insert the same alias between
+    /// the check and the delete, and the delete would erase it.
+    fn remove_model_alias_if_unused(&self, alias: &str, canonical_id: &str) {
+        let Entry::Occupied(mut entry) = self.model_alias_index.entry(alias.to_string()) else {
+            return;
+        };
+        if entry.get().as_ref() != canonical_id {
+            return;
+        }
+        if self.model_declares_alias(canonical_id, alias) {
+            return;
+        }
+
+        match self.find_model_declaring_alias(alias, canonical_id) {
+            Some(next_canonical_id) => {
+                tracing::debug!(
+                    alias,
+                    previous_canonical_id = canonical_id,
+                    next_canonical_id = %next_canonical_id,
+                    "Handing model alias to another model that declares it"
+                );
+                entry.insert(Arc::from(next_canonical_id.as_str()));
+            }
+            None => {
+                entry.remove();
+            }
+        }
+    }
+
+    /// Whether any worker still serving `canonical_id` declares `alias`.
+    fn model_declares_alias(&self, canonical_id: &str, alias: &str) -> bool {
+        self.model_index.get(canonical_id).is_some_and(|workers| {
+            workers
+                .iter()
+                .any(|worker| Self::worker_declares_alias(worker, canonical_id, alias))
+        })
+    }
+
+    /// Find a registered model other than `exclude` that declares `alias`.
+    fn find_model_declaring_alias(&self, alias: &str, exclude: &str) -> Option<String> {
+        self.model_index.iter().find_map(|entry| {
+            let canonical_id = entry.key();
+            if canonical_id == exclude {
+                return None;
+            }
+            entry
+                .value()
+                .iter()
+                .any(|worker| Self::worker_declares_alias(worker, canonical_id, alias))
+                .then(|| canonical_id.clone())
+        })
+    }
+
+    fn worker_declares_alias(worker: &Arc<dyn Worker>, canonical_id: &str, alias: &str) -> bool {
+        worker.models().into_iter().any(|model| {
+            model.id == canonical_id && model.aliases.iter().any(|candidate| candidate == alias)
+        })
     }
 
     /// Shared backend for [`Self::transition_status`] and
@@ -1524,6 +1772,21 @@ mod tests {
         }
 
         Arc::new(builder.build())
+    }
+
+    fn worker_with_model_aliases(
+        url: &str,
+        canonical_id: &str,
+        aliases: &[&str],
+        worker_type: WorkerType,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(canonical_id).with_aliases(aliases.iter().copied()))
+                .worker_type(worker_type)
+                .health_config(no_health_check())
+                .build(),
+        )
     }
 
     fn assert_sampling_defaults_group_values(
@@ -2227,6 +2490,225 @@ mod tests {
         let stats = registry.stats();
         assert_eq!(stats.total_workers, 1);
         assert_eq!(stats.total_models, 2);
+    }
+
+    #[test]
+    fn test_model_alias_resolves_to_canonical_model() {
+        let registry = WorkerRegistry::new();
+        let aliased = worker_with_model_aliases(
+            "http://aliased:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Prefill,
+        );
+        let canonical_only =
+            worker_with_model_aliases("http://canonical:8080", "GLM-5.2", &[], WorkerType::Decode);
+
+        registry.register(aliased).unwrap();
+        registry.register(canonical_only).unwrap();
+
+        let canonical_workers = registry.get_by_model("GLM-5.2");
+        assert_eq!(canonical_workers.len(), 2);
+        let alias_workers = registry.get_by_model("GLM-5.2-Coding");
+        assert_eq!(alias_workers.len(), 2);
+        assert_eq!(
+            registry
+                .get_workers_filtered(
+                    Some("GLM-5.2-Coding"),
+                    Some(WorkerType::Prefill),
+                    None,
+                    None,
+                    false,
+                )
+                .len(),
+            1
+        );
+        assert_eq!(
+            registry
+                .get_workers_filtered(
+                    Some("GLM-5.2-Coding"),
+                    Some(WorkerType::Decode),
+                    None,
+                    None,
+                    false,
+                )
+                .len(),
+            1
+        );
+
+        assert_eq!(
+            registry.resolve_model_alias("GLM-5.2-Coding").as_deref(),
+            Some("GLM-5.2")
+        );
+        assert!(registry.resolve_model_alias("GLM-5.2").is_none());
+        assert!(registry.get_by_model("glm-5.2-coding").is_empty());
+        assert_eq!(registry.get_models(), vec!["GLM-5.2"]);
+        assert_eq!(registry.stats().total_models, 1);
+    }
+
+    #[test]
+    fn test_model_alias_tracks_shared_workers_through_removal() {
+        let registry = WorkerRegistry::new();
+        let first = worker_with_model_aliases(
+            "http://first:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Prefill,
+        );
+        let second = worker_with_model_aliases(
+            "http://second:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Decode,
+        );
+        let first_id = registry.register(first).unwrap();
+        let second_id = registry.register(second).unwrap();
+
+        assert_eq!(registry.get_by_model("GLM-5.2-Coding").len(), 2);
+        registry.remove(&first_id).unwrap();
+        let remaining = registry.get_by_model("GLM-5.2-Coding");
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].url(), "http://second:8080");
+
+        registry.remove(&second_id).unwrap();
+        assert!(registry.get_by_model("GLM-5.2-Coding").is_empty());
+        assert!(registry.resolve_model_alias("GLM-5.2-Coding").is_none());
+    }
+
+    #[test]
+    fn test_model_alias_replace_refreshes_kept_and_changed_aliases() {
+        let registry = WorkerRegistry::new();
+        let original: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .model(ModelCard::new("GLM-5.2").with_alias("old"))
+                .build(),
+        );
+        let worker_id = registry.register(original).unwrap();
+        let replacement: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .model(ModelCard::new("GLM-5.2").with_alias("new"))
+                .build(),
+        );
+
+        assert!(registry.replace(&worker_id, replacement));
+
+        assert!(registry.get_by_model("old").is_empty());
+        assert_eq!(registry.get_by_model("new").len(), 1);
+    }
+
+    #[test]
+    fn test_contains_model_accepts_canonical_id_and_alias() {
+        let registry = WorkerRegistry::new();
+        let worker = worker_with_model_aliases(
+            "http://worker:8080",
+            "GLM-5.2",
+            &["GLM-5.2-Coding"],
+            WorkerType::Regular,
+        );
+        let worker_id = registry.register(worker).unwrap();
+
+        assert!(registry.contains_model("GLM-5.2"));
+        assert!(registry.contains_model("GLM-5.2-Coding"));
+        assert!(!registry.contains_model("GLM-5.2-Unknown"));
+        // The wildcard is a routing sentinel, never a registered name.
+        assert!(!registry.contains_model(UNKNOWN_MODEL_ID));
+
+        assert!(registry.remove(&worker_id).is_some());
+        assert!(!registry.contains_model("GLM-5.2"));
+        assert!(!registry.contains_model("GLM-5.2-Coding"));
+    }
+
+    #[test]
+    fn test_model_alias_is_handed_over_when_its_owner_leaves() {
+        // Two models declare the same alias. `add_model_alias` keeps the
+        // first, so removing the first must not strand the second, which
+        // still advertises the alias.
+        let registry = WorkerRegistry::new();
+        let owner = worker_with_model_aliases(
+            "http://owner:8080",
+            "GLM-5.2",
+            &["shared-alias"],
+            WorkerType::Regular,
+        );
+        let loser = worker_with_model_aliases(
+            "http://loser:8080",
+            "Qwen3",
+            &["shared-alias"],
+            WorkerType::Regular,
+        );
+        let owner_id = registry.register(owner).unwrap();
+        registry.register(loser).unwrap();
+
+        assert_eq!(
+            registry.resolve_model_alias("shared-alias").as_deref(),
+            Some("GLM-5.2")
+        );
+
+        assert!(registry.remove(&owner_id).is_some());
+
+        assert_eq!(
+            registry.resolve_model_alias("shared-alias").as_deref(),
+            Some("Qwen3"),
+            "alias must move to the remaining model that declares it"
+        );
+        let workers = registry.get_by_model("shared-alias");
+        assert_eq!(workers.len(), 1);
+        assert_eq!(workers[0].url(), "http://loser:8080");
+    }
+
+    #[test]
+    fn test_model_alias_never_shadows_a_registered_model_id() {
+        // Registered later than the model it collides with.
+        let registry = WorkerRegistry::new();
+        let canonical =
+            worker_with_model_aliases("http://canonical:8080", "GLM-5.2", &[], WorkerType::Regular);
+        let colliding = worker_with_model_aliases(
+            "http://colliding:8080",
+            "Qwen3",
+            &["GLM-5.2"],
+            WorkerType::Regular,
+        );
+        let canonical_id = registry.register(canonical).unwrap();
+        registry.register(colliding).unwrap();
+
+        assert!(registry.resolve_model_alias("GLM-5.2").is_none());
+        // The real model has gone, so the name must resolve to nothing at all
+        // rather than start pointing at Qwen3.
+        assert!(registry.remove(&canonical_id).is_some());
+        assert!(registry.resolve_model_alias("GLM-5.2").is_none());
+        assert!(registry.get_by_model("GLM-5.2").is_empty());
+    }
+
+    #[test]
+    fn test_registered_model_id_evicts_a_colliding_alias() {
+        // Registered earlier than the model it collides with: same invariant,
+        // resolved from the other side.
+        let registry = WorkerRegistry::new();
+        let colliding = worker_with_model_aliases(
+            "http://colliding:8080",
+            "Qwen3",
+            &["GLM-5.2"],
+            WorkerType::Regular,
+        );
+        registry.register(colliding).unwrap();
+        assert_eq!(
+            registry.resolve_model_alias("GLM-5.2").as_deref(),
+            Some("Qwen3")
+        );
+
+        let canonical =
+            worker_with_model_aliases("http://canonical:8080", "GLM-5.2", &[], WorkerType::Regular);
+        let canonical_id = registry.register(canonical).unwrap();
+
+        assert!(registry.resolve_model_alias("GLM-5.2").is_none());
+        assert_eq!(registry.get_by_model("GLM-5.2").len(), 1);
+        assert_eq!(
+            registry.get_by_model("GLM-5.2")[0].url(),
+            "http://canonical:8080"
+        );
+
+        assert!(registry.remove(&canonical_id).is_some());
+        assert!(registry.get_by_model("GLM-5.2").is_empty());
     }
 
     #[test]

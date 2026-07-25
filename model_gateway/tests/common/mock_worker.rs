@@ -12,7 +12,7 @@ use std::{
 };
 
 use axum::{
-    extract::{Json, Path, State},
+    extract::{Json, Multipart, Path, State},
     http::StatusCode,
     response::{
         sse::{Event, KeepAlive},
@@ -155,6 +155,96 @@ fn clear_scheduler_controls(port: u16) {
     }
 }
 
+/// Records the JSON body of every chat request a mock worker receives.
+///
+/// A test can only read the mock's canned answer, which says nothing about
+/// what the gateway actually forwarded. This exposes the forwarded body, so a
+/// test can assert on rewrites the gateway performs on the way out — for
+/// instance that a request addressed to a model alias reaches the worker under
+/// the canonical model ID.
+///
+/// Kept in a port-keyed table rather than in [`MockWorkerConfig`], for the
+/// same reason as [`SchedulerControls`]: adding a knob must not force every
+/// existing `MockWorkerConfig { .. }` literal in the suite to gain a field.
+#[derive(Default)]
+pub struct RequestRecorder {
+    bodies: Mutex<Vec<serde_json::Value>>,
+}
+
+impl RequestRecorder {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Every body received so far, oldest first.
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn bodies(&self) -> Vec<serde_json::Value> {
+        self.bodies
+            .lock()
+            .expect("request recorder mutex poisoned")
+            .clone()
+    }
+
+    /// The single body received, panicking unless exactly one arrived.
+    #[expect(
+        clippy::expect_used,
+        reason = "test helper - panicking on failure is intentional"
+    )]
+    pub fn only_body(&self) -> serde_json::Value {
+        let bodies = self.bodies();
+        assert_eq!(
+            bodies.len(),
+            1,
+            "expected exactly one recorded request, got {}",
+            bodies.len()
+        );
+        bodies.into_iter().next().expect("length checked above")
+    }
+}
+
+static REQUEST_RECORDERS: OnceLock<Mutex<HashMap<u16, Arc<RequestRecorder>>>> = OnceLock::new();
+
+fn request_recorders_table() -> &'static Mutex<HashMap<u16, Arc<RequestRecorder>>> {
+    REQUEST_RECORDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Attach a recorder to the mock worker that will bind `port`. Call before the
+/// worker starts, like [`set_scheduler_controls`].
+#[expect(
+    clippy::expect_used,
+    reason = "test helper - panicking on failure is intentional"
+)]
+pub fn set_request_recorder(port: u16, recorder: Arc<RequestRecorder>) {
+    request_recorders_table()
+        .lock()
+        .expect("request recorders mutex poisoned")
+        .insert(port, recorder);
+}
+
+fn record_request(port: u16, body: &serde_json::Value) {
+    let recorder = request_recorders_table()
+        .lock()
+        .ok()
+        .and_then(|table| table.get(&port).cloned());
+    if let Some(recorder) = recorder {
+        if let Ok(mut bodies) = recorder.bodies.lock() {
+            bodies.push(body.clone());
+        }
+    }
+}
+
+/// Remove a port's recorder on teardown so a later worker reusing the port
+/// does not append to it. Tolerant of a poisoned mutex since it runs from
+/// `Drop`.
+fn clear_request_recorder(port: u16) {
+    if let Ok(mut table) = request_recorders_table().lock() {
+        table.remove(&port);
+    }
+}
+
 /// Configuration for mock worker behavior
 #[derive(Clone)]
 pub struct MockWorkerConfig {
@@ -233,6 +323,10 @@ impl MockWorker {
             .route("/v1/messages", post(messages_handler))
             .route("/v1/completions", post(completions_handler))
             .route("/v1/rerank", post(rerank_handler))
+            .route(
+                "/v1/audio/transcriptions",
+                post(audio_transcriptions_handler),
+            )
             .route("/v1/responses", post(responses_handler))
             .route("/v1/responses/{response_id}", get(responses_get_handler))
             .route(
@@ -293,10 +387,11 @@ impl Drop for MockWorker {
         if let Some(shutdown_tx) = self.shutdown_tx.take() {
             let _ = shutdown_tx.send(());
         }
-        // Prune our scheduler controls so a later worker reusing this port
-        // doesn't inherit stale state.
+        // Prune our scheduler controls and recorder so a later worker reusing
+        // this port doesn't inherit stale state.
         if let Some(port) = self.bound_port {
             clear_scheduler_controls(port);
+            clear_request_recorder(port);
         }
     }
 }
@@ -585,6 +680,9 @@ async fn chat_completions_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> Response {
     let config = config.read().await;
+    // Before any early return, so a test still sees what arrived even when the
+    // mock is configured to fail the request.
+    record_request(config.port, &payload);
 
     if should_fail(&config) {
         return (
@@ -1530,6 +1628,39 @@ fn response_exists_for_port(port: u16, response_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+/// Minimal `/v1/audio/transcriptions` handler.
+///
+/// Collects the multipart text fields into a JSON object and records it, so a
+/// test can assert on the model name the gateway put in the form. The audio
+/// part itself is drained and discarded.
+async fn audio_transcriptions_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    mut multipart: Multipart,
+) -> Response {
+    let config = config.read().await;
+
+    let mut fields = serde_json::Map::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        let Some(name) = field.name().map(ToOwned::to_owned) else {
+            continue;
+        };
+        if name == "file" {
+            let _ = field.bytes().await;
+            continue;
+        }
+        if let Ok(value) = field.text().await {
+            fields.insert(name, serde_json::Value::String(value));
+        }
+    }
+    record_request(config.port, &serde_json::Value::Object(fields));
+
+    if should_fail(&config) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, "Simulated failure").into_response();
+    }
+
+    Json(json!({"text": "mock transcription"})).into_response()
+}
+
 // Minimal rerank handler returning mock results; router shapes final response
 #[expect(
     clippy::unwrap_used,
@@ -1540,6 +1671,7 @@ async fn rerank_handler(
     Json(payload): Json<serde_json::Value>,
 ) -> impl IntoResponse {
     let config = config.read().await;
+    record_request(config.port, &payload);
 
     // Simulate response delay
     if config.response_delay_ms > 0 {
