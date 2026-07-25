@@ -639,7 +639,7 @@ impl WorkerRegistry {
         // tombstone could delete a locally-configured worker. The promotion
         // happens inside replace_inner, under the per-worker mutation lock.
         if let Some(existing_id) = self.url_to_id.get(worker.url()).map(|e| e.clone()) {
-            if !self.replace_inner(&existing_id, worker, Some(WorkerOrigin::Local)) {
+            if !self.replace_inner(&existing_id, worker, Some(WorkerOrigin::Local), None) {
                 // replace() returned false — worker was removed concurrently.
                 // The mutation lock prevents stale indexes, so this is safe to ignore.
                 tracing::warn!(
@@ -676,7 +676,7 @@ impl WorkerRegistry {
     /// Emits [`WorkerEvent::Replaced`] on success. Holds the per-worker
     /// mutation lock for the entire diff + broadcast sequence.
     pub fn replace(&self, worker_id: &WorkerId, new_worker: Arc<dyn Worker>) -> bool {
-        self.replace_inner(worker_id, new_worker, None)
+        self.replace_inner(worker_id, new_worker, None, None)
     }
 
     /// Replace an existing worker and claim local ownership of its URL.
@@ -686,17 +686,29 @@ impl WorkerRegistry {
     /// worker on this node, so the worker must be published to the mesh and
     /// must not be deleted by a peer tombstone.
     ///
-    /// Used by `PUT /workers/{worker_id}`. The `worker_id` check is the point
-    /// of this method: `PUT` answers 202 and registers later, so a `DELETE`
-    /// (or `DELETE` + `POST`) can land in between. Returning `false` for a
-    /// missing ID makes the late write fail instead of resurrecting a deleted
-    /// worker or overwriting a newly created one.
+    /// Used by `PUT /workers/{worker_id}`, which answers 202 and registers
+    /// later, so other writes for the same URL can land in between. Both
+    /// preconditions are checked under the per-worker mutation lock and the
+    /// call returns `false` if either fails:
+    ///
+    /// - `worker_id` still exists — a `DELETE` (or `DELETE` + `POST`) makes
+    ///   the late write fail instead of resurrecting a deleted worker or
+    ///   overwriting a newly created one.
+    /// - the worker is still at `expected_revision` — a second `PUT` that
+    ///   finished first makes the older, slower one fail instead of silently
+    ///   restoring the older specification.
     pub fn replace_claiming_local(
         &self,
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
+        expected_revision: u64,
     ) -> bool {
-        self.replace_inner(worker_id, new_worker, Some(WorkerOrigin::Local))
+        self.replace_inner(
+            worker_id,
+            new_worker,
+            Some(WorkerOrigin::Local),
+            Some(expected_revision),
+        )
     }
 
     /// Core replacement shared by [`Self::replace`] and
@@ -710,6 +722,7 @@ impl WorkerRegistry {
         worker_id: &WorkerId,
         new_worker: Arc<dyn Worker>,
         promote_origin: Option<WorkerOrigin>,
+        expected_revision: Option<u64>,
     ) -> bool {
         // Serialize concurrent replacements for the same worker ID.
         // Lock is held only during the in-memory diff (no I/O, microseconds).
@@ -724,6 +737,23 @@ impl WorkerRegistry {
             Some(entry) => entry.clone(),
             None => return false,
         };
+
+        // Each replacement bumps the revision (see `inherit_shared_state_from`
+        // below), so a caller that captured the revision before it started can
+        // detect that another replacement landed first and give up.
+        if let Some(expected) = expected_revision {
+            let current = old_worker.revision();
+            if current != expected {
+                tracing::warn!(
+                    worker_id = %worker_id.as_str(),
+                    worker_url = old_worker.url(),
+                    expected,
+                    current,
+                    "Aborting replacement: worker was replaced before the lock was acquired"
+                );
+                return false;
+            }
+        }
 
         let old_models: HashSet<String> = Self::worker_model_ids(&old_worker).into_iter().collect();
         let new_models: HashSet<String> = Self::worker_model_ids(&new_worker).into_iter().collect();

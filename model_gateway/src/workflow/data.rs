@@ -78,13 +78,17 @@ pub enum WorkerRegistrationMode {
     #[default]
     Upsert,
     /// `PUT /workers/{id}`: replace the worker only while `worker_id` still
-    /// holds the URL.
+    /// holds the URL at `expected_revision`.
     ///
-    /// `PUT` answers 202 and registers later, so a `DELETE` (or `DELETE` +
-    /// `POST`) can land in between. Binding the write to the ID the request
-    /// validated makes the late write fail instead of resurrecting a deleted
-    /// worker or overwriting a newly created one.
-    ReplaceById { worker_id: String },
+    /// `PUT` answers 202 and registers later, so other writes for the same URL
+    /// can land in between. Binding the write to what the request validated
+    /// makes the late write fail instead of resurrecting a worker a `DELETE`
+    /// removed, overwriting one a `POST` created, or restoring the older
+    /// specification over a second `PUT` that finished first.
+    ReplaceById {
+        worker_id: String,
+        expected_revision: u64,
+    },
 }
 
 /// Wrapper for worker list that can be serialized

@@ -44,6 +44,7 @@ fn check_batch(
 ) -> WorkflowResult<()> {
     match registration_mode {
         WorkerRegistrationMode::CreateOnly => {
+            let mut batch_urls = HashSet::with_capacity(workers.len());
             for worker in workers {
                 if registry.get_by_url(worker.url()).is_some() {
                     return Err(step_failed(format!(
@@ -51,13 +52,22 @@ fn check_batch(
                         worker.url()
                     )));
                 }
+                // The registry is keyed by URL, so a batch that repeats one
+                // would register the first and reject the rest.
+                if !batch_urls.insert(worker.url()) {
+                    return Err(step_failed(format!(
+                        "Worker {} appears twice in the same registration",
+                        worker.url()
+                    )));
+                }
             }
             Ok(())
         }
-        // One ID replaces one worker. `PUT` rejects the URL change that a
-        // multi-worker expansion implies, so this batch always holds one
-        // worker; the check keeps a future caller from writing a partial batch.
-        WorkerRegistrationMode::ReplaceById { worker_id } if workers.len() != 1 => {
+        // One ID replaces one worker. `PUT` is refused up front when the
+        // router runs data-parallel, which is the only expansion that turns
+        // one spec into several workers; the check keeps a future caller from
+        // writing a partial batch.
+        WorkerRegistrationMode::ReplaceById { worker_id, .. } if workers.len() != 1 => {
             Err(step_failed(format!(
                 "Replacing worker {worker_id} needs exactly one worker, got {}",
                 workers.len()
@@ -77,17 +87,20 @@ fn register_worker(
             .register(worker.clone())
             .ok_or_else(|| step_failed(format!("Worker {} already exists", worker.url()))),
         WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
-        WorkerRegistrationMode::ReplaceById { worker_id } => {
+        WorkerRegistrationMode::ReplaceById {
+            worker_id,
+            expected_revision,
+        } => {
             let worker_id = WorkerId::from_string(worker_id.clone());
             let url = worker.url().to_string();
-            // Fails when the ID no longer exists, which is exactly the case
-            // where a concurrent DELETE (or DELETE + POST) has already retired
-            // the worker this replacement was written against.
-            if registry.replace_claiming_local(&worker_id, worker) {
+            // Fails when the ID is gone or the worker moved on, which covers
+            // the concurrent DELETE, DELETE + POST, and second-PUT cases.
+            if registry.replace_claiming_local(&worker_id, worker, *expected_revision) {
                 Ok(worker_id)
             } else {
                 Err(step_failed(format!(
-                    "Worker {} at {url} is no longer registered, so the replacement was dropped",
+                    "Worker {} at {url} is no longer at revision {expected_revision}, \
+                     so the replacement was dropped",
                     worker_id.as_str()
                 )))
             }
@@ -233,9 +246,10 @@ mod tests {
         worker_at("http://worker:8080", model_id)
     }
 
-    fn replace_by_id(worker_id: &WorkerId) -> WorkerRegistrationMode {
+    fn replace_by_id(worker_id: &WorkerId, expected_revision: u64) -> WorkerRegistrationMode {
         WorkerRegistrationMode::ReplaceById {
             worker_id: worker_id.as_str().to_string(),
+            expected_revision,
         }
     }
 
@@ -309,7 +323,7 @@ mod tests {
             worker_at("http://worker:8080", "new-model"),
             worker_at("http://worker:8081", "new-model"),
         ];
-        let result = check_batch(&registry, &batch, &replace_by_id(&original_id));
+        let result = check_batch(&registry, &batch, &replace_by_id(&original_id, 0));
 
         assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
     }
@@ -322,13 +336,52 @@ mod tests {
         let new_id = register_worker(
             &registry,
             worker("replacement-model"),
-            &replace_by_id(&original_id),
+            &replace_by_id(&original_id, 0),
         )
         .unwrap();
 
         assert_eq!(new_id, original_id);
         assert_eq!(registry.get_by_model("replacement-model").len(), 1);
         assert!(registry.get_by_model("original-model").is_empty());
+    }
+
+    #[test]
+    fn replace_by_id_does_not_restore_an_older_spec_over_a_newer_one() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+
+        // Two PUTs are accepted while the worker sits at revision 0, and the
+        // newer one finishes first. Replacing bumps the revision.
+        register_worker(
+            &registry,
+            worker("newer-model"),
+            &replace_by_id(&original_id, 0),
+        )
+        .unwrap();
+
+        let result = register_worker(
+            &registry,
+            worker("older-model"),
+            &replace_by_id(&original_id, 0),
+        );
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert_eq!(registry.get_by_model("newer-model").len(), 1);
+        assert!(registry.get_by_model("older-model").is_empty());
+    }
+
+    #[test]
+    fn create_only_rejects_a_batch_that_repeats_a_url() {
+        let registry = WorkerRegistry::new();
+
+        let batch = vec![
+            worker_at("http://rank0:8080", "new-model"),
+            worker_at("http://rank0:8080", "new-model"),
+        ];
+        let result = check_batch(&registry, &batch, &WorkerRegistrationMode::CreateOnly);
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert!(registry.get_by_url("http://rank0:8080").is_none());
     }
 
     #[test]
@@ -341,7 +394,7 @@ mod tests {
         let result = register_worker(
             &registry,
             worker("replacement-model"),
-            &replace_by_id(&original_id),
+            &replace_by_id(&original_id, 0),
         );
 
         assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
@@ -361,7 +414,7 @@ mod tests {
         let result = register_worker(
             &registry,
             worker("replacement-model"),
-            &replace_by_id(&original_id),
+            &replace_by_id(&original_id, 0),
         );
 
         assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
