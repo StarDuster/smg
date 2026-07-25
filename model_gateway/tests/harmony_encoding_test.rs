@@ -10,7 +10,7 @@ use std::sync::Arc;
 use smg::{
     worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, Worker, WorkerType},
     workflow::{
-        data::{WorkerKind, WorkerWorkflowData},
+        data::{WorkerKind, WorkerRegistrationMode, WorkerWorkflowData},
         steps::local::EnsureHarmonyEncodingStep,
     },
 };
@@ -39,6 +39,7 @@ fn context(
         WorkflowInstanceId::new(),
         WorkerWorkflowData {
             config: openai_protocol::worker::WorkerSpec::new("grpc://127.0.0.1:1"),
+            registration_mode: WorkerRegistrationMode::Upsert,
             worker_kind: Some(kind),
             connection_mode: Some(connection),
             detected_runtime_type: None,

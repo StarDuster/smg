@@ -18,7 +18,7 @@ use tracing::warn;
 use crate::{
     config::RouterConfig,
     worker::{registry::WorkerId, worker::worker_to_info, WorkerRegistry, WorkerType},
-    workflow::{Job, JobQueue},
+    workflow::{Job, JobQueue, WorkerRegistrationMode},
 };
 
 /// Error types for worker service operations
@@ -279,6 +279,7 @@ impl WorkerService {
 
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::CreateOnly,
         };
 
         self.get_job_queue()?
@@ -326,6 +327,7 @@ impl WorkerService {
         // The workflow uses register_or_replace() which does overwrite-then-diff.
         let job = Job::AddWorker {
             config: Box::new(config),
+            registration_mode: WorkerRegistrationMode::Upsert,
         };
 
         let job_queue = self.get_job_queue()?;

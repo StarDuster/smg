@@ -27,7 +27,11 @@ use openai_protocol::worker::WorkerSpec;
 pub use shared::{ActivateWorkersStep, RegisterWorkersStep, UpdatePoliciesStep, WorkerList};
 use wfaas::{BackoffStrategy, FailureAction, RetryPolicy, StepDefinition, WorkflowDefinition};
 
-use crate::{app_context::AppContext, config::RouterConfig, workflow::data::WorkerWorkflowData};
+use crate::{
+    app_context::AppContext,
+    config::RouterConfig,
+    workflow::data::{WorkerRegistrationMode, WorkerWorkflowData},
+};
 
 /// Create the unified worker registration workflow definition.
 ///
@@ -274,10 +278,12 @@ pub fn create_worker_registration_workflow(
 /// Create initial workflow data for the unified worker registration workflow.
 pub fn create_worker_workflow_data(
     config: WorkerSpec,
+    registration_mode: WorkerRegistrationMode,
     app_context: Arc<AppContext>,
 ) -> WorkerWorkflowData {
     WorkerWorkflowData {
         config,
+        registration_mode,
         worker_kind: None,
         connection_mode: None,
         detected_runtime_type: None,

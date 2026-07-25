@@ -5,16 +5,17 @@ use std::{collections::HashSet, sync::Arc};
 use async_trait::async_trait;
 use tracing::debug;
 use wfaas::{
-    StepExecutor, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
+    StepExecutor, StepId, StepResult, WorkflowContext, WorkflowData, WorkflowError, WorkflowResult,
 };
 
 use crate::{
     observability::metrics::Metrics,
     worker::{
+        registry::WorkerId,
         worker::{ConnectionModeExt, WorkerTypeExt},
-        WorkerRegistry,
+        Worker, WorkerRegistry,
     },
-    workflow::data::WorkerRegistrationData,
+    workflow::data::{WorkerRegistrationData, WorkerRegistrationMode},
 };
 
 /// Unified step to register workers in the registry.
@@ -23,6 +24,24 @@ use crate::{
 /// in context containing `Vec<Arc<dyn Worker>>`.
 /// Works with any workflow data type that implements `WorkerRegistrationData`.
 pub struct RegisterWorkersStep;
+
+fn register_worker(
+    registry: &WorkerRegistry,
+    worker: Arc<dyn Worker>,
+    registration_mode: WorkerRegistrationMode,
+) -> WorkflowResult<WorkerId> {
+    match registration_mode {
+        WorkerRegistrationMode::CreateOnly => {
+            registry
+                .register(worker.clone())
+                .ok_or_else(|| WorkflowError::StepFailed {
+                    step_id: StepId::new("register_workers"),
+                    message: format!("Worker {} already exists", worker.url()),
+                })
+        }
+        WorkerRegistrationMode::Upsert => Ok(registry.register_or_replace(worker)),
+    }
+}
 
 #[async_trait]
 impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorkersStep {
@@ -39,11 +58,14 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
             .ok_or_else(|| WorkflowError::ContextValueNotFound("workers".to_string()))?;
 
         let mut worker_ids = Vec::with_capacity(workers.len());
+        let registration_mode = context.data.registration_mode();
 
         for worker in workers {
-            let worker_id = app_context
-                .worker_registry
-                .register_or_replace(Arc::clone(worker));
+            let worker_id = register_worker(
+                &app_context.worker_registry,
+                Arc::clone(worker),
+                registration_mode,
+            )?;
             debug!(
                 "Registered worker {} (model: {}) with ID {:?}",
                 worker.url(),
@@ -119,10 +141,8 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
         // WorkerMonitor subscribes to registry events directly (see
         // `worker::monitor::WorkerMonitor::start_event_loop`), so this
         // step no longer has to push group-add notifications. The
-        // monitor's event loop reconciles the impacted groups as soon
-        // as the `WorkerEvent::Registered` (new worker) or
-        // `WorkerEvent::Replaced` (same-URL update) broadcast fires
-        // from `worker_registry.register_or_replace()` above.
+        // monitor's event loop reconciles the impacted groups as soon as the
+        // registry emits `WorkerEvent::Registered` or `WorkerEvent::Replaced`.
 
         // Note: worker_ids are stored for potential future use but not persisted
         // as they are internal registry identifiers
@@ -137,5 +157,61 @@ impl<D: WorkerRegistrationData + WorkflowData> StepExecutor<D> for RegisterWorke
 
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use openai_protocol::model_card::ModelCard;
+
+    use super::*;
+    use crate::worker::BasicWorkerBuilder;
+
+    fn worker(model_id: &str) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new("http://worker:8080")
+                .model(ModelCard::new(model_id))
+                .build(),
+        )
+    }
+
+    #[test]
+    fn create_only_rejects_duplicate_url_and_keeps_existing_worker() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+
+        let result = register_worker(
+            &registry,
+            worker("replacement-model"),
+            WorkerRegistrationMode::CreateOnly,
+        );
+
+        assert!(matches!(result, Err(WorkflowError::StepFailed { .. })));
+        assert_eq!(
+            registry.get_id_by_url("http://worker:8080"),
+            Some(original_id)
+        );
+        assert_eq!(registry.get_by_model("original-model").len(), 1);
+        assert!(registry.get_by_model("replacement-model").is_empty());
+    }
+
+    #[test]
+    fn upsert_replaces_the_worker_at_the_same_url() {
+        let registry = WorkerRegistry::new();
+        let original_id = registry.register(worker("original-model")).unwrap();
+
+        let new_id = register_worker(
+            &registry,
+            worker("replacement-model"),
+            WorkerRegistrationMode::Upsert,
+        )
+        .unwrap();
+
+        // Replacing at the same URL keeps the worker ID stable, so callers
+        // holding the ID from the original registration stay valid.
+        assert_eq!(new_id, original_id);
+        assert_eq!(registry.get_id_by_url("http://worker:8080"), Some(new_id));
+        assert_eq!(registry.get_by_model("replacement-model").len(), 1);
+        assert!(registry.get_by_model("original-model").is_empty());
     }
 }

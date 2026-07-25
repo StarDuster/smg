@@ -58,6 +58,20 @@ pub trait WorkerRegistrationData: WorkflowData {
 
     /// Get the labels for policy registration.
     fn get_labels(&self) -> Option<&HashMap<String, String>>;
+
+    /// Select create-only or upsert behavior for the final registry write.
+    fn registration_mode(&self) -> WorkerRegistrationMode;
+}
+
+/// Semantics of the final worker registry write.
+///
+/// API `POST /workers` is create-only. Full replacement, startup, and service
+/// discovery reconcile existing state and therefore use upsert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkerRegistrationMode {
+    CreateOnly,
+    #[default]
+    Upsert,
 }
 
 /// Wrapper for worker list that can be serialized
@@ -93,6 +107,10 @@ impl WorkerList {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkerWorkflowData {
     pub config: WorkerSpec,
+    /// Defaults to upsert so persisted workflows from older versions preserve
+    /// their historical registration behavior when deserialized.
+    #[serde(default)]
+    pub registration_mode: WorkerRegistrationMode,
     /// Determined by ClassifyWorkerTypeStep (Local or External).
     pub worker_kind: Option<WorkerKind>,
     // -- Local-only fields --
@@ -142,6 +160,10 @@ impl WorkerRegistrationData for WorkerWorkflowData {
 
     fn get_labels(&self) -> Option<&HashMap<String, String>> {
         Some(&self.final_labels)
+    }
+
+    fn registration_mode(&self) -> WorkerRegistrationMode {
+        self.registration_mode
     }
 }
 
