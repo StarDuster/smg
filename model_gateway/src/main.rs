@@ -373,6 +373,14 @@ struct CliArgs {
     #[arg(long, help_heading = "Service Discovery (Kubernetes)", value_parser = parse_model_id_from)]
     model_id_from: Option<String>,
 
+    /// Accept an extra client-facing model name for a served model
+    /// (format: alias=canonical, repeatable). Applied to every locally
+    /// registered worker whose model ID equals the canonical side,
+    /// including workers registered by Kubernetes service discovery.
+    /// Matching is case-sensitive.
+    #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Routing Policy")]
+    model_alias: Vec<String>,
+
     // ==================== Logging ====================
     /// Directory to store log files
     #[arg(long, help_heading = "Logging")]
@@ -834,6 +842,26 @@ enum OracleConnectSource {
 /// Validate `--model-id-from` value at CLI parse time.
 fn parse_model_id_from(s: &str) -> Result<String, String> {
     ModelIdSource::parse(s)?;
+    Ok(s.to_string())
+}
+
+/// Validate `--model-alias` value at CLI parse time (format: alias=canonical).
+fn parse_model_alias(s: &str) -> Result<String, String> {
+    let Some((alias, canonical)) = s.split_once('=') else {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Expected: <alias>=<canonical>"
+        ));
+    };
+    if alias.is_empty() || canonical.is_empty() {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Alias and canonical model ID must be non-empty"
+        ));
+    }
+    if alias == canonical {
+        return Err(format!(
+            "Invalid model-alias value '{s}'. Alias must differ from the canonical model ID"
+        ));
+    }
     Ok(s.to_string())
 }
 
@@ -1387,6 +1415,29 @@ impl CliArgs {
             _ => (None, None, None),
         };
 
+        // clap validated each entry's shape; here we only reject the same
+        // alias naming two different canonical models, which would make the
+        // routing outcome depend on argument order.
+        let mut model_aliases: HashMap<String, String> = HashMap::new();
+        for entry in &self.model_alias {
+            let Some((alias, canonical)) = entry.split_once('=') else {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_alias".to_string(),
+                    value: entry.clone(),
+                    reason: "Expected: <alias>=<canonical>".to_string(),
+                });
+            };
+            if let Some(previous) = model_aliases.insert(alias.to_string(), canonical.to_string()) {
+                if previous != canonical {
+                    return Err(ConfigError::InvalidValue {
+                        field: "model_alias".to_string(),
+                        value: alias.to_string(),
+                        reason: format!("Alias maps to both '{previous}' and '{canonical}'"),
+                    });
+                }
+            }
+        }
+
         let builder = RouterConfig::builder()
             .mode(mode)
             .policy(policy)
@@ -1464,6 +1515,7 @@ impl CliArgs {
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
+            .model_aliases(model_aliases)
             .maybe_oracle(oracle)
             .maybe_postgres(postgres)
             .maybe_redis(redis)

@@ -472,6 +472,12 @@ impl RouterConfigBuilder {
         self
     }
 
+    /// Alias → canonical model ID map applied to locally created workers.
+    pub fn model_aliases(mut self, aliases: HashMap<String, String>) -> Self {
+        self.config.model_aliases = aliases;
+        self
+    }
+
     pub fn disable_tokenizer_autoload(mut self, disable: bool) -> Self {
         self.config.disable_tokenizer_autoload = disable;
         self

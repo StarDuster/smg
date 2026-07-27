@@ -241,6 +241,21 @@ Note: Enabling service discovery automatically enables IGW mode.
 |--------|-------------|
 | `--model-id-from` | Override each worker's `model_id` from pod metadata. Accepted values: `namespace`, `label:<key>`, or `annotation:<key>`. |
 
+### Model Aliases
+
+| Option | Description |
+|--------|-------------|
+| `--model-alias` | Accept an extra client-facing model name for a served model (format: `<alias>=<canonical>`, repeatable). Applied to every locally registered worker whose model ID equals the canonical side, including workers registered by Kubernetes service discovery. Matching is case-sensitive. Aliased requests are routed to the canonical model and answered with the canonical model ID; `/v1/models` lists canonical IDs only. |
+
+Example:
+
+```bash
+smg launch \
+  --service-discovery ... \
+  --model-alias GLM-5.2-Coding=GLM-5.2 \
+  --model-alias glm-5.2=GLM-5.2
+```
+
 ---
 
 ## Tokenizer Configuration

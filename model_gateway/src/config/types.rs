@@ -122,6 +122,14 @@ pub struct RouterConfig {
     /// Overrides model_path tokenizer if provided
     pub tokenizer_path: Option<String>,
     pub chat_template: Option<String>,
+    /// Alias → canonical model ID map. At worker creation, every alias whose
+    /// canonical ID equals the worker's model ID is added to that model's
+    /// `ModelCard.aliases`. This is the configuration entry for deployments
+    /// whose workers are registered automatically (startup URLs or Kubernetes
+    /// service discovery), where no caller supplies a `ModelCard` by hand.
+    /// Lookup stays case-sensitive; entries name exact client-sent strings.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub model_aliases: HashMap<String, String>,
     /// Disable automatic tokenizer loading at startup and worker registration
     #[serde(default)]
     pub disable_tokenizer_autoload: bool,
@@ -822,6 +830,7 @@ impl Default for RouterConfig {
             tokenizer_path: None,
             chat_template: None,
             disable_tokenizer_autoload: false,
+            model_aliases: HashMap::new(),
             history_backend: default_history_backend(),
             oracle: None,
             postgres: None,
