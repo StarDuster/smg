@@ -83,6 +83,7 @@ impl ConfigValidator {
         Self::validate_storage_context_headers(config)?;
         Self::validate_tenant_resolution(config)?;
         Self::validate_tenant_api_keys(config)?;
+        Self::validate_model_aliases(config)?;
         if let Some(discovery) = &config.discovery {
             Self::validate_discovery(discovery, &config.mode)?;
         }
@@ -114,6 +115,27 @@ impl ConfigValidator {
         }
 
         Self::validate_tokenizer_cache(&config.tokenizer_cache)?;
+
+        Ok(())
+    }
+
+    fn validate_model_aliases(config: &RouterConfig) -> ConfigResult<()> {
+        for (alias, canonical) in &config.model_aliases {
+            if alias.is_empty() || canonical.is_empty() {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_aliases".to_string(),
+                    value: format!("{alias}={canonical}"),
+                    reason: "Alias and canonical model ID must be non-empty".to_string(),
+                });
+            }
+            if alias == canonical {
+                return Err(ConfigError::InvalidValue {
+                    field: "model_aliases".to_string(),
+                    value: alias.clone(),
+                    reason: "Alias must differ from the canonical model ID".to_string(),
+                });
+            }
+        }
 
         Ok(())
     }
@@ -1104,6 +1126,29 @@ mod tests {
         );
 
         assert!(ConfigValidator::validate(&config).is_ok());
+    }
+
+    #[test]
+    fn test_validate_model_aliases() {
+        let mut config = regular_mode_config();
+        config.model_aliases = std::collections::HashMap::from([
+            ("GLM-5.2-Coding".to_string(), "GLM-5.2".to_string()),
+            ("glm-5.2".to_string(), "GLM-5.2".to_string()),
+        ]);
+        assert!(ConfigValidator::validate(&config).is_ok());
+
+        for (alias, canonical) in [
+            ("", "GLM-5.2"),
+            ("GLM-5.2-Coding", ""),
+            ("GLM-5.2", "GLM-5.2"),
+        ] {
+            config.model_aliases =
+                std::collections::HashMap::from([(alias.to_string(), canonical.to_string())]);
+            assert!(matches!(
+                ConfigValidator::validate(&config),
+                Err(ConfigError::InvalidValue { ref field, .. }) if field == "model_aliases"
+            ));
+        }
     }
 
     fn regular_mode_config() -> RouterConfig {

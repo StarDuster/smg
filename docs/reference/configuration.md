@@ -245,7 +245,9 @@ Note: Enabling service discovery automatically enables IGW mode.
 
 | Option | Description |
 |--------|-------------|
-| `--model-alias` | Accept an extra client-facing model name for a served model (format: `<alias>=<canonical>`, repeatable). Applied to every locally registered worker whose model ID equals the canonical side, including workers registered by Kubernetes service discovery. Matching is case-sensitive. Aliased requests are routed to the canonical model and answered with the canonical model ID; `/v1/models` lists canonical IDs only. |
+| `--model-alias` | Accept an extra client-facing model name for a served model (format: `<alias>=<canonical>`, repeatable). Applied after worker metadata discovery to every local worker whose model ID equals the canonical side. Matching is case-sensitive. Aliased requests are sent to the canonical model; backend responses are passed through unchanged. `/v1/models` lists canonical IDs only. |
+
+Aliases do not participate in Kubernetes Pod selection or model discovery. A discovered worker's canonical model ID continues to come from the backend `served_model_name`; aliases only add names that resolve to that canonical ID after registration.
 
 Example:
 

@@ -63,18 +63,10 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
         let kv_role = labels.remove("kv_role");
         let kv_engine_id = labels.remove("kv_engine_id").filter(|s| !s.is_empty());
 
-        // Determine model_id: config.models > discovered labels > UNKNOWN_MODEL_ID
-        let model_id = config
-            .models
-            .primary()
-            .map(|m| m.id.clone())
-            .or_else(|| labels.get("served_model_name").cloned())
-            .or_else(|| labels.get("model_id").cloned())
-            .or_else(|| labels.get("model_path").cloned())
-            .unwrap_or_else(|| UNKNOWN_MODEL_ID.to_string());
+        let model_id = resolve_model_id(config, &labels);
 
         let model_card = build_model_card(
-            &model_id,
+            model_id,
             config,
             &labels,
             &app_context.router_config.model_aliases,
@@ -199,6 +191,22 @@ impl StepExecutor<WorkerWorkflowData> for CreateLocalWorkerStep {
     fn is_retryable(&self, _error: &WorkflowError) -> bool {
         false
     }
+}
+
+/// Resolve the canonical model ID before aliases are applied.
+///
+/// Kubernetes service discovery creates a spec without model cards, so its
+/// canonical ID comes from the backend's `served_model_name`. Router aliases
+/// are deliberately absent from this function and cannot change discovery.
+fn resolve_model_id<'a>(config: &'a WorkerSpec, labels: &'a HashMap<String, String>) -> &'a str {
+    config
+        .models
+        .primary()
+        .map(|model| model.id.as_str())
+        .or_else(|| labels.get("served_model_name").map(String::as_str))
+        .or_else(|| labels.get("model_id").map(String::as_str))
+        .or_else(|| labels.get("model_path").map(String::as_str))
+        .unwrap_or(UNKNOWN_MODEL_ID)
 }
 
 fn build_model_card(
@@ -337,6 +345,7 @@ fn normalize_url(url: &str, connection_mode: ConnectionMode) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::worker::WorkerRegistry;
 
     #[test]
     fn normalize_url_preserves_existing_schemes() {
@@ -392,6 +401,38 @@ mod tests {
 
         assert_eq!(card.id, "GLM-5.2");
         assert_eq!(card.aliases, vec!["GLM-5.2-Coding".to_string()]);
+    }
+
+    #[test]
+    fn service_discovery_keeps_served_model_name_canonical() {
+        // Service discovery supplies an empty model list. Metadata discovery
+        // supplies the backend's served_model_name.
+        let spec = WorkerSpec::new("http://worker:8080");
+        let labels = HashMap::from([
+            ("served_model_name".to_string(), "GLM-5.2".to_string()),
+            ("model_id".to_string(), "GLM-5.2-Coding".to_string()),
+            ("model_path".to_string(), "unrelated-alias".to_string()),
+        ]);
+        let aliases = alias_map(&[
+            ("GLM-5.2-Coding", "GLM-5.2"),
+            ("unrelated-alias", "other-model"),
+        ]);
+
+        let model_id = resolve_model_id(&spec, &labels);
+        let card = build_model_card(model_id, &spec, &labels, &aliases);
+        let worker: Arc<dyn Worker> =
+            Arc::new(BasicWorkerBuilder::new(&spec.url).model(card).build());
+        let registry = WorkerRegistry::new();
+        registry.register(worker.clone()).unwrap();
+
+        assert_eq!(worker.model_id(), "GLM-5.2");
+        assert_eq!(registry.get_by_model("GLM-5.2").len(), 1);
+        assert_eq!(registry.get_by_model("GLM-5.2-Coding").len(), 1);
+        assert_eq!(
+            registry.resolve_model_alias("GLM-5.2-Coding").as_deref(),
+            Some("GLM-5.2")
+        );
+        assert!(registry.get_by_model("unrelated-alias").is_empty());
     }
 
     #[test]

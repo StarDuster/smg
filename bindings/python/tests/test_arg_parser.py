@@ -5,6 +5,7 @@ These tests focus on testing the argument parsing logic in isolation,
 without starting actual router instances.
 """
 
+import argparse
 from types import SimpleNamespace
 
 import pytest
@@ -72,6 +73,30 @@ class TestRouterArgs:
         # Test multiple equals signs (should use first one)
         result = RouterArgs._parse_selector(["app=worker=extra"])
         assert result == {"app": "worker=extra"}
+
+    def test_parse_model_aliases(self):
+        result = RouterArgs._parse_model_aliases(
+            ["GLM-5.2-Coding=GLM-5.2", "glm-5.2=GLM-5.2"]
+        )
+
+        assert result == {
+            "GLM-5.2-Coding": "GLM-5.2",
+            "glm-5.2": "GLM-5.2",
+        }
+
+    @pytest.mark.parametrize(
+        "entries",
+        [
+            ["missing-separator"],
+            ["=GLM-5.2"],
+            ["GLM-5.2-Coding="],
+            ["GLM-5.2=GLM-5.2"],
+            ["shared=model-a", "shared=model-b"],
+        ],
+    )
+    def test_parse_model_aliases_rejects_invalid_entries(self, entries):
+        with pytest.raises(ValueError):
+            RouterArgs._parse_model_aliases(entries)
 
     def test_parse_prefill_urls_valid(self):
         """Test parsing valid prefill URL arguments."""
@@ -664,6 +689,32 @@ class TestParseRouterArgs:
             assert router_args.selector == {"app": "worker", "env": "prod"}
             assert router_args.service_discovery_port == 8080
             assert router_args.service_discovery_namespace == "default"
+
+    def test_parse_repeated_model_alias_args(self):
+        router_args = parse_router_args(
+            [
+                "--model-alias",
+                "GLM-5.2-Coding=GLM-5.2",
+                "--model-alias",
+                "glm-5.2=GLM-5.2",
+            ]
+        )
+
+        assert router_args.model_aliases == {
+            "GLM-5.2-Coding": "GLM-5.2",
+            "glm-5.2": "GLM-5.2",
+        }
+
+    def test_parse_prefixed_model_alias_args(self):
+        parser = argparse.ArgumentParser()
+        RouterArgs.add_cli_args(parser, use_router_prefix=True)
+        namespace = parser.parse_args(
+            ["--router-model-alias", "GLM-5.2-Coding=GLM-5.2"]
+        )
+
+        router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
+
+        assert router_args.model_aliases == {"GLM-5.2-Coding": "GLM-5.2"}
 
     def test_parse_retry_and_circuit_breaker_args(self):
         """Test parsing retry and circuit breaker arguments."""
