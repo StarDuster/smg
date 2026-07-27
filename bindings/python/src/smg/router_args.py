@@ -93,6 +93,7 @@ class RouterArgs:
     router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     model_id_from: str | None = None
+    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     # Prometheus configuration
     prometheus_port: int | None = None
     prometheus_host: str | None = None
@@ -678,6 +679,17 @@ class RouterArgs:
                 "Override each worker's model ID from pod metadata."
                 " Accepted values: 'namespace', 'label:<key>', 'annotation:<key>'."
                 " The backend-discovered model name becomes an alias."
+            ),
+        )
+        k8s_group.add_argument(
+            f"--{prefix}model-alias",
+            type=str,
+            action="append",
+            default=[],
+            help=(
+                "Accept an extra client-facing model name for a served model."
+                " Format: <alias>=<canonical>. Repeat for multiple aliases."
+                " Matching is case-sensitive."
             ),
         )
         # Prometheus configuration
@@ -1323,6 +1335,9 @@ class RouterArgs:
         args_dict["storage_context_headers"] = cls._parse_selector(
             cli_args_dict.get(f"{prefix}storage_context_headers", None)
         )
+        args_dict["model_aliases"] = cls._parse_model_aliases(
+            cli_args_dict.get(f"{prefix}model_alias", [])
+        )
 
         # Mooncake-specific annotation
         args_dict["bootstrap_port_annotation"] = "sglang.ai/bootstrap-port"
@@ -1378,6 +1393,34 @@ class RouterArgs:
                 key, value = item.split("=", 1)
                 selector[key] = value
         return selector
+
+    @staticmethod
+    def _parse_model_aliases(alias_list):
+        if not alias_list:
+            return {}
+
+        aliases = {}
+        for item in alias_list:
+            if "=" not in item:
+                raise ValueError(
+                    f"Invalid model alias '{item}'. Expected format: <alias>=<canonical>"
+                )
+            alias, canonical = item.split("=", 1)
+            if not alias or not canonical:
+                raise ValueError(
+                    f"Invalid model alias '{item}'. Alias and canonical model ID must be non-empty"
+                )
+            if alias == canonical:
+                raise ValueError(
+                    f"Invalid model alias '{item}'. Alias must differ from the canonical model ID"
+                )
+            previous = aliases.get(alias)
+            if previous is not None and previous != canonical:
+                raise ValueError(
+                    f"Invalid model alias '{alias}'. It maps to both '{previous}' and '{canonical}'"
+                )
+            aliases[alias] = canonical
+        return aliases
 
     @staticmethod
     def _parse_prefill_urls(prefill_list):

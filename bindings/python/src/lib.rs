@@ -486,6 +486,7 @@ struct Router {
     encode_policy: Option<PolicyType>,
     multimodal_tensor_transport: Option<String>,
     multimodal_shm_min_bytes: Option<usize>,
+    model_aliases: HashMap<String, String>,
 }
 
 impl Router {
@@ -795,6 +796,7 @@ impl Router {
             .maybe_model_path(self.model_path.as_ref())
             .maybe_tokenizer_path(self.tokenizer_path.as_ref())
             .maybe_chat_template(self.chat_template.as_ref())
+            .model_aliases(self.model_aliases.clone())
             .maybe_oracle(oracle)
             .maybe_postgres(postgres_config)
             .maybe_redis(redis_config)
@@ -953,6 +955,7 @@ impl Router {
         encode_policy = None,
         multimodal_tensor_transport = None,
         multimodal_shm_min_bytes = None,
+        model_aliases = HashMap::new(),
     ))]
     #[expect(clippy::too_many_arguments)]
     #[expect(
@@ -1079,6 +1082,7 @@ impl Router {
         encode_policy: Option<PolicyType>,
         multimodal_tensor_transport: Option<String>,
         multimodal_shm_min_bytes: Option<usize>,
+        model_aliases: HashMap<String, String>,
     ) -> PyResult<Self> {
         let mut all_urls = worker_urls.clone();
 
@@ -1219,6 +1223,7 @@ impl Router {
             encode_policy,
             multimodal_tensor_transport,
             multimodal_shm_min_bytes,
+            model_aliases,
         })
     }
 
