@@ -75,9 +75,7 @@ class TestRouterArgs:
         assert result == {"app": "worker=extra"}
 
     def test_parse_model_aliases(self):
-        result = RouterArgs._parse_model_aliases(
-            ["GLM-5.2-Coding=GLM-5.2", "glm-5.2=GLM-5.2"]
-        )
+        result = RouterArgs._parse_model_aliases(["GLM-5.2-Coding=GLM-5.2", "glm-5.2=GLM-5.2"])
 
         assert result == {
             "GLM-5.2-Coding": "GLM-5.2",
@@ -708,9 +706,7 @@ class TestParseRouterArgs:
     def test_parse_prefixed_model_alias_args(self):
         parser = argparse.ArgumentParser()
         RouterArgs.add_cli_args(parser, use_router_prefix=True)
-        namespace = parser.parse_args(
-            ["--router-model-alias", "GLM-5.2-Coding=GLM-5.2"]
-        )
+        namespace = parser.parse_args(["--router-model-alias", "GLM-5.2-Coding=GLM-5.2"])
 
         router_args = RouterArgs.from_cli_args(namespace, use_router_prefix=True)
 
