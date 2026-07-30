@@ -41,6 +41,8 @@ mod model_alias_tests {
         let worker = registry.get(&worker_id).unwrap();
         let mut spec = worker.metadata().spec.as_ref().clone();
         spec.models = vec![ModelCard::new(CANONICAL_MODEL).with_alias(MODEL_ALIAS)].into();
+        spec.labels
+            .insert("realtime".to_string(), "true".to_string());
         let replacement = BasicWorkerBuilder::from_spec(spec)
             .health_config(worker.metadata().health_config.clone())
             .health_endpoint(&worker.metadata().health_endpoint)
@@ -204,6 +206,51 @@ mod model_alias_tests {
             CANONICAL_MODEL,
             "the multipart form must carry the canonical model ID"
         );
+
+        ctx.shutdown().await;
+    }
+
+    #[tokio::test]
+    async fn test_realtime_rest_routes_forward_the_canonical_model() {
+        let recorder = RequestRecorder::new();
+        set_request_recorder(WORKER_PORT + 5, Arc::clone(&recorder));
+
+        let ctx = AppTestContext::new(vec![TestWorkerConfig::healthy(WORKER_PORT + 5)]).await;
+        let app = ctx.create_app();
+        declare_alias(&ctx, &format!("http://127.0.0.1:{}", WORKER_PORT + 5));
+
+        for (endpoint, payload) in [
+            (
+                "/v1/realtime/sessions",
+                json!({"type": "realtime", "model": MODEL_ALIAS}),
+            ),
+            (
+                "/v1/realtime/client_secrets",
+                json!({
+                    "session": {"type": "realtime", "model": MODEL_ALIAS}
+                }),
+            ),
+            (
+                "/v1/realtime/transcription_sessions",
+                json!({"type": "transcription", "model": MODEL_ALIAS}),
+            ),
+        ] {
+            let request = Request::builder()
+                .method("POST")
+                .uri(endpoint)
+                .header(CONTENT_TYPE, "application/json")
+                .header("Authorization", "Bearer test-key")
+                .body(Body::from(payload.to_string()))
+                .unwrap();
+            let response = app.clone().oneshot(request).await.unwrap();
+            assert_eq!(response.status(), StatusCode::OK, "endpoint {endpoint}");
+        }
+
+        let forwarded = recorder.bodies();
+        assert_eq!(forwarded.len(), 3);
+        assert_eq!(forwarded[0]["model"], CANONICAL_MODEL);
+        assert_eq!(forwarded[1]["session"]["model"], CANONICAL_MODEL);
+        assert_eq!(forwarded[2]["model"], CANONICAL_MODEL);
 
         ctx.shutdown().await;
     }

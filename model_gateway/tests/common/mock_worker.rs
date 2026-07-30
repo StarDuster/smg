@@ -328,6 +328,12 @@ impl MockWorker {
                 post(audio_transcriptions_handler),
             )
             .route("/v1/responses", post(responses_handler))
+            .route("/v1/realtime/sessions", post(realtime_rest_handler))
+            .route("/v1/realtime/client_secrets", post(realtime_rest_handler))
+            .route(
+                "/v1/realtime/transcription_sessions",
+                post(realtime_rest_handler),
+            )
             .route("/v1/responses/{response_id}", get(responses_get_handler))
             .route(
                 "/v1/responses/{response_id}/cancel",
@@ -759,6 +765,20 @@ async fn chat_completions_handler(
         }))
         .into_response()
     }
+}
+
+async fn realtime_rest_handler(
+    State(config): State<Arc<RwLock<MockWorkerConfig>>>,
+    Json(payload): Json<serde_json::Value>,
+) -> Response {
+    let config = config.read().await;
+    record_request(config.port, &payload);
+
+    if should_fail(&config) {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    Json(json!({"status": "ok"})).into_response()
 }
 
 async fn messages_handler(

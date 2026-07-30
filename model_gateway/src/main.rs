@@ -378,7 +378,7 @@ struct CliArgs {
     /// registered worker whose model ID equals the canonical side,
     /// including workers registered by Kubernetes service discovery.
     /// Matching is case-sensitive.
-    #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Routing Policy")]
+    #[arg(long = "model-alias", action = ArgAction::Append, value_parser = parse_model_alias, help_heading = "Service Discovery (Kubernetes)")]
     model_alias: Vec<String>,
 
     // ==================== Logging ====================
@@ -1912,5 +1912,16 @@ mod tests {
 
         let server_config = cli.to_server_config(router_config).unwrap();
         assert_eq!(server_config.runtime_worker_threads, None);
+    }
+
+    #[test]
+    fn conflicting_model_aliases_are_rejected() {
+        let cli = cli_args_from(&["--model-alias", "x=a", "--model-alias", "x=b"]);
+
+        assert!(matches!(
+            cli.to_router_config(vec![], vec![]),
+            Err(ConfigError::InvalidValue { field, reason, .. })
+                if field == "model_alias" && reason == "Alias maps to both 'a' and 'b'"
+        ));
     }
 }

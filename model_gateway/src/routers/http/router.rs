@@ -74,6 +74,41 @@ pub struct Router {
     webrtc_stun_server: Option<String>,
 }
 
+trait RealtimeRestRequest: serde::Serialize + Clone {
+    fn model(&self) -> Option<&str>;
+    fn set_model(&mut self, model: String);
+}
+
+impl RealtimeRestRequest for RealtimeSessionCreateRequest {
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn set_model(&mut self, model: String) {
+        self.model = Some(model);
+    }
+}
+
+impl RealtimeRestRequest for RealtimeClientSecretCreateRequest {
+    fn model(&self) -> Option<&str> {
+        self.session.model.as_deref()
+    }
+
+    fn set_model(&mut self, model: String) {
+        self.session.model = Some(model);
+    }
+}
+
+impl RealtimeRestRequest for RealtimeTranscriptionSessionCreateRequest {
+    fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    fn set_model(&mut self, model: String) {
+        self.model = Some(model);
+    }
+}
+
 impl std::fmt::Debug for Router {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Router")
@@ -235,6 +270,47 @@ impl Router {
                 ..Default::default()
             })
             .await
+    }
+
+    async fn route_realtime_rest<T: RealtimeRestRequest + Sync>(
+        &self,
+        headers: Option<&HeaderMap>,
+        body: &T,
+        endpoint: &'static str,
+        endpoint_label: &'static str,
+    ) -> Response {
+        let requested_model = body.model().unwrap_or_default();
+        let canonical_model = self.worker_registry.resolve_model_alias(requested_model);
+        let model = canonical_model.as_deref().unwrap_or(requested_model);
+        let worker = self.select_realtime_worker(model, headers).await;
+
+        if let Some(canonical_model) = canonical_model.as_deref() {
+            let mut body = body.clone();
+            body.set_model(canonical_model.to_string());
+            forward_realtime_rest(
+                RealtimeLabels::HTTP,
+                &self.client,
+                worker,
+                headers,
+                &body,
+                model,
+                endpoint,
+                endpoint_label,
+            )
+            .await
+        } else {
+            forward_realtime_rest(
+                RealtimeLabels::HTTP,
+                &self.client,
+                worker,
+                headers,
+                body,
+                model,
+                endpoint,
+                endpoint_label,
+            )
+            .await
+        }
     }
 
     pub async fn route_typed_request<T: GenerationRequest + serde::Serialize + Clone>(
@@ -1340,15 +1416,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RealtimeSessionCreateRequest,
     ) -> Response {
-        let model = body.model.as_deref().unwrap_or_default();
-        let worker = self.select_realtime_worker(model, headers).await;
-        forward_realtime_rest(
-            RealtimeLabels::HTTP,
-            &self.client,
-            worker,
+        self.route_realtime_rest(
             headers,
             body,
-            model,
             "/v1/realtime/sessions",
             metrics_labels::ENDPOINT_REALTIME_SESSIONS,
         )
@@ -1360,15 +1430,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RealtimeClientSecretCreateRequest,
     ) -> Response {
-        let model = body.session.model.as_deref().unwrap_or_default();
-        let worker = self.select_realtime_worker(model, headers).await;
-        forward_realtime_rest(
-            RealtimeLabels::HTTP,
-            &self.client,
-            worker,
+        self.route_realtime_rest(
             headers,
             body,
-            model,
             "/v1/realtime/client_secrets",
             metrics_labels::ENDPOINT_REALTIME_CLIENT_SECRETS,
         )
@@ -1380,15 +1444,9 @@ impl RouterTrait for Router {
         headers: Option<&HeaderMap>,
         body: &RealtimeTranscriptionSessionCreateRequest,
     ) -> Response {
-        let model = body.model.as_deref().unwrap_or_default();
-        let worker = self.select_realtime_worker(model, headers).await;
-        forward_realtime_rest(
-            RealtimeLabels::HTTP,
-            &self.client,
-            worker,
+        self.route_realtime_rest(
             headers,
             body,
-            model,
             "/v1/realtime/transcription_sessions",
             metrics_labels::ENDPOINT_REALTIME_TRANSCRIPTION,
         )
