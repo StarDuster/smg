@@ -93,7 +93,6 @@ class RouterArgs:
     router_selector: dict[str, str] = dataclasses.field(default_factory=dict)
     bootstrap_port_annotation: str = "sglang.ai/bootstrap-port"
     model_id_from: str | None = None
-    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
     # Prometheus configuration
     prometheus_port: int | None = None
     prometheus_host: str | None = None
@@ -201,6 +200,8 @@ class RouterArgs:
     mesh_advertise_host: str | None = None
     mesh_port: int = 39527
     mesh_peer_urls: list[str] = dataclasses.field(default_factory=list)
+    # Append new fields here to preserve positional callers.
+    model_aliases: dict[str, str] = dataclasses.field(default_factory=dict)
 
     @staticmethod
     def add_cli_args(
