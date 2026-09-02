@@ -23,12 +23,25 @@ use crate::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
             multimodal,
         },
+        PD_PREFILL_QUEUE_FULL, PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        ConnectionModeExt, HashRing, ModelWorkerSnapshot, RoutingPool, RuntimeType, Worker,
-        WorkerRegistry, WorkerType,
+        acquire_prefill, ConnectionModeExt, HashRing, ModelWorkerSnapshot, PrefillAcquireError,
+        PrefillAdmission, PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
+        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerRegistry, WorkerType,
     },
 };
+
+enum GrpcPdCandidateError {
+    Unavailable,
+    AtCapacity,
+}
+
+impl PrefillCandidateError for GrpcPdCandidateError {
+    fn is_at_capacity(&self) -> bool {
+        matches!(self, Self::AtCapacity)
+    }
+}
 
 /// Result type for PD worker pair selection: (prefill, decode, runtime_type)
 type PdWorkerPair = (Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType);
@@ -46,6 +59,7 @@ pub(crate) struct WorkerSelectionStage {
     worker_registry: Arc<WorkerRegistry>,
     policy_registry: Arc<PolicyRegistry>,
     mode: WorkerSelectionMode,
+    prefill_admission: Option<Arc<PrefillAdmission>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -63,11 +77,13 @@ impl WorkerSelectionStage {
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
         mode: WorkerSelectionMode,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
     ) -> Self {
         Self {
             worker_registry,
             policy_registry,
             mode,
+            prefill_admission,
         }
     }
 }
@@ -75,85 +91,112 @@ impl WorkerSelectionStage {
 #[async_trait]
 impl PipelineStage for WorkerSelectionStage {
     async fn execute(&self, ctx: &mut RequestContext) -> Result<Option<Response>, Response> {
-        let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
-            error!(
-                function = "WorkerSelectionStage::execute",
-                "Preparation stage not completed"
-            );
-            error::internal_error(
-                "preparation_stage_not_completed",
-                "Preparation stage not completed",
-            )
-        })?;
+        let (text, tokens) = {
+            let prep = ctx.state.preparation.as_ref().ok_or_else(|| {
+                error!(
+                    function = "WorkerSelectionStage::execute",
+                    "Preparation stage not completed"
+                );
+                error::internal_error(
+                    "preparation_stage_not_completed",
+                    "Preparation stage not completed",
+                )
+            })?;
+            let text = prep.routing_text().map(str::to_string);
+            let ids = prep.token_ids();
+            let tokens = if ids.is_empty() {
+                None
+            } else {
+                Some(ids.to_vec())
+            };
+            (text, tokens)
+        };
 
-        let intermediate = ctx.state.multimodal_intermediate.as_ref();
+        let encode_item_hashes = if self.mode == WorkerSelectionMode::EncodePrefillDecode {
+            match encode_item_hashes(ctx.state.multimodal_intermediate.as_ref()) {
+                Ok(hashes) => hashes,
+                Err(err) => {
+                    error!(
+                        function = "WorkerSelectionStage::execute",
+                        error = %err,
+                        "Failed to derive encode item routing hashes"
+                    );
+                    return Err(error::internal_error(
+                        "encode_routing_hash_failed",
+                        format!("Failed to derive encode routing hashes: {err}"),
+                    ));
+                }
+            }
+        } else {
+            Vec::new()
+        };
 
-        let text = prep.routing_text();
-
-        // Get tokens for PrefixHash policy support
-        let ids = prep.token_ids();
-        let tokens = if ids.is_empty() { None } else { Some(ids) };
-
-        let headers = ctx.input.headers.as_ref();
+        let headers = ctx.input.headers.clone();
         let rid_key = self
             .policy_registry
             .derive_rid_key(ctx.input.request_type.rid())
             .map(str::to_string);
         ctx.state.sticky_key = rid_key.clone().or_else(|| {
             self.policy_registry
-                .sticky_header_key(headers)
+                .sticky_header_key(headers.as_ref())
                 .map(str::to_string)
         });
         let rid_key = rid_key.as_deref();
 
-        let model_id = ctx.input.model_id.as_str();
+        let model_id = ctx.input.model_id.clone();
+        let sticky_key = ctx.state.sticky_key.clone();
         let workers = match self.mode {
             WorkerSelectionMode::Regular => {
-                match self.select_single_worker(model_id, text, tokens, headers, rid_key) {
+                match self.select_single_worker(
+                    &model_id,
+                    text.as_deref(),
+                    tokens.as_deref(),
+                    headers.as_ref(),
+                    rid_key,
+                ) {
                     Some(w) => WorkerSelection::Single { worker: w },
-                    None => return Err(self.selection_failure(model_id, &[WorkerType::Regular])),
+                    None => return Err(self.selection_failure(&model_id, &[WorkerType::Regular])),
                 }
             }
             WorkerSelectionMode::PrefillDecode => {
-                match self.select_pd_pair(model_id, text, tokens, headers, rid_key) {
-                    Some((prefill, decode, runtime_type)) => WorkerSelection::Disaggregated {
-                        encode_assignments: None,
-                        prefill,
-                        decode,
-                        runtime_type,
-                    },
-                    None => {
-                        return Err(self.selection_failure(
-                            model_id,
-                            &[WorkerType::Prefill, WorkerType::Decode],
-                        ))
+                match self
+                    .admit_pd_pair(
+                        &model_id,
+                        text.as_deref(),
+                        tokens.as_deref(),
+                        headers.as_ref(),
+                        rid_key,
+                        sticky_key.as_deref(),
+                    )
+                    .await
+                {
+                    Ok((prefill, decode, runtime_type, guard)) => {
+                        ctx.state.pd_prefill_guard = Some(guard);
+                        WorkerSelection::Disaggregated {
+                            encode_assignments: None,
+                            prefill,
+                            decode,
+                            runtime_type,
+                        }
                     }
+                    Err(response) => return Err(response),
                 }
             }
             WorkerSelectionMode::EncodePrefillDecode => {
-                let encode_item_hashes = match encode_item_hashes(intermediate) {
-                    Ok(hashes) => hashes,
-                    Err(err) => {
-                        error!(
-                            function = "WorkerSelectionStage::execute",
-                            error = %err,
-                            "Failed to derive encode item routing hashes"
-                        );
-                        return Err(error::internal_error(
-                            "encode_routing_hash_failed",
-                            format!("Failed to derive encode routing hashes: {err}"),
-                        ));
-                    }
-                };
-                match self.select_encode_prefill_decode_workers(
-                    model_id,
-                    text,
-                    tokens,
-                    headers,
-                    rid_key,
-                    &encode_item_hashes,
-                ) {
-                    Some((encode_assignments, prefill, decode, runtime_type)) => {
+                match self
+                    .admit_encode_prefill_decode_workers(
+                        &model_id,
+                        text.as_deref(),
+                        tokens.as_deref(),
+                        headers.as_ref(),
+                        rid_key,
+                        sticky_key.as_deref(),
+                        &encode_item_hashes,
+                    )
+                    .await
+                {
+                    Ok((encode_assignments, prefill, decode, runtime_type, guard)) => {
+                        ctx.state.pd_prefill_guard = Some(guard);
                         WorkerSelection::Disaggregated {
                             encode_assignments: if encode_assignments.is_empty() {
                                 None
@@ -165,17 +208,7 @@ impl PipelineStage for WorkerSelectionStage {
                             runtime_type,
                         }
                     }
-                    None => {
-                        // Encode is a demanded leg only when the request
-                        // carries encode items; an idle-but-vetoed encode pool
-                        // must not shed a text-only request.
-                        let legs: &[WorkerType] = if encode_item_hashes.is_empty() {
-                            &[WorkerType::Prefill, WorkerType::Decode]
-                        } else {
-                            &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
-                        };
-                        return Err(self.selection_failure(model_id, legs));
-                    }
+                    Err(response) => return Err(response),
                 }
             }
         };
@@ -185,7 +218,7 @@ impl PipelineStage for WorkerSelectionStage {
         // only to fail deep in assembly. The prefill leg builds the request in
         // disaggregated mode, so its runtime is the one that must support the
         // request's modalities.
-        if let Some(intermediate) = intermediate {
+        if let Some(intermediate) = ctx.state.multimodal_intermediate.as_ref() {
             if let Err(err) = multimodal::ensure_backend_supports_modalities(
                 selection_runtime(&workers),
                 intermediate,
@@ -342,6 +375,100 @@ impl WorkerSelectionStage {
             .collect()
     }
 
+    fn admission_response(
+        &self,
+        model_id: &str,
+        legs: &[WorkerType],
+        error: PrefillAcquireError<GrpcPdCandidateError>,
+    ) -> Response {
+        match error {
+            PrefillAcquireError::Rejected(PrefillAdmissionRejection::QueueFull) => {
+                error::too_many_requests(PD_PREFILL_QUEUE_FULL, "Prefill admission queue is full")
+            }
+            PrefillAcquireError::Rejected(PrefillAdmissionRejection::QueueTimeout) => {
+                error::too_many_requests(
+                    PD_PREFILL_QUEUE_TIMEOUT,
+                    "Timed out waiting for Prefill admission",
+                )
+            }
+            PrefillAcquireError::Rejected(PrefillAdmissionRejection::Unavailable)
+            | PrefillAcquireError::Candidate(_) => self.selection_failure(model_id, legs),
+        }
+    }
+
+    async fn admit_pd_pair(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+        sticky_key: Option<&str>,
+    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType, PrefillLoadGuard), Response> {
+        let ((prefill, decode, runtime_type), guard) = acquire_prefill(
+            self.prefill_admission.as_deref(),
+            sticky_key,
+            |(prefill, _, _): &PdWorkerPair| prefill,
+            |capacity| self.select_pd_pair_inner(model_id, text, tokens, headers, rid_key, capacity),
+        )
+        .await
+        .map_err(|error| {
+            self.admission_response(
+                model_id,
+                &[WorkerType::Prefill, WorkerType::Decode],
+                error,
+            )
+        })?;
+        Ok((prefill, decode, runtime_type, guard))
+    }
+
+    async fn admit_encode_prefill_decode_workers(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+        sticky_key: Option<&str>,
+        encode_item_hashes: &[Vec<u8>],
+    ) -> Result<
+        (
+            Vec<EncodeWorkerAssignment>,
+            Arc<dyn Worker>,
+            Arc<dyn Worker>,
+            RuntimeType,
+            PrefillLoadGuard,
+        ),
+        Response,
+    > {
+        let ((encode_assignments, prefill, decode, runtime_type), guard) = acquire_prefill(
+            self.prefill_admission.as_deref(),
+            sticky_key,
+            |(_, prefill, _, _): &EncodePrefillDecodeWorkerSelection| prefill,
+            |capacity| {
+                self.select_encode_prefill_decode_workers_inner(
+                    model_id,
+                    text,
+                    tokens,
+                    headers,
+                    rid_key,
+                    encode_item_hashes,
+                    capacity,
+                )
+            },
+        )
+        .await
+        .map_err(|error| {
+            let legs: &[WorkerType] = if encode_item_hashes.is_empty() {
+                &[WorkerType::Prefill, WorkerType::Decode]
+            } else {
+                &[WorkerType::Prefill, WorkerType::Decode, WorkerType::Encode]
+            };
+            self.admission_response(model_id, legs, error)
+        })?;
+        Ok((encode_assignments, prefill, decode, runtime_type, guard))
+    }
+
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -350,6 +477,19 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
     ) -> Option<PdWorkerPair> {
+        self.select_pd_pair_inner(model_id, text, tokens, headers, rid_key, None)
+            .ok()
+    }
+
+    fn select_pd_pair_inner(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+        capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdWorkerPair, GrpcPdCandidateError> {
         // Both legs derive from ONE membership snapshot: separate pool
         // lookups could straddle a concurrent replacement and pair workers
         // that never coexisted. The pools are strictly gRPC (a ZMQ leg would
@@ -362,17 +502,22 @@ impl WorkerSelectionStage {
 
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
         }
 
         if all_decode.is_empty() {
             warn!("No available decode workers");
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
         }
 
         // Determine the runtime type from prefill workers.
         // All workers in a PD pair must use the same runtime.
-        let first_runtime = all_prefill.first()?.metadata().spec.runtime_type;
+        let first_runtime = all_prefill
+            .first()
+            .ok_or(GrpcPdCandidateError::Unavailable)?
+            .metadata()
+            .spec
+            .runtime_type;
 
         // Check for mixed runtimes in both prefill and decode pools
         let prefill_mixed = all_prefill
@@ -395,7 +540,7 @@ impl WorkerSelectionStage {
         let target_runtime = first_runtime;
 
         // Filter both pools to the target runtime
-        let available_prefill: Vec<_> = all_prefill
+        let mut available_prefill: Vec<_> = all_prefill
             .into_iter()
             .filter(|w| w.metadata().spec.runtime_type == target_runtime)
             .collect();
@@ -406,7 +551,19 @@ impl WorkerSelectionStage {
 
         if available_prefill.is_empty() || available_decode.is_empty() {
             warn!("No available PD pair for runtime {:?}", target_runtime);
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
+        }
+
+        if let Some(capacity) = capacity {
+            let had_available = !available_prefill.is_empty();
+            available_prefill.retain(|worker| capacity.has_capacity(worker));
+            if available_prefill.is_empty() {
+                return Err(if had_available {
+                    GrpcPdCandidateError::AtCapacity
+                } else {
+                    GrpcPdCandidateError::Unavailable
+                });
+            }
         }
 
         // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
@@ -427,13 +584,15 @@ impl WorkerSelectionStage {
             hash_ring,
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = self
+            .policy_registry
+            .select_worker(&prefill_policy, &available_prefill, &info)
+            .ok_or(GrpcPdCandidateError::Unavailable)?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+        let decode_idx = self
+            .policy_registry
+            .select_worker(&decode_policy, &available_decode, &info)
+            .ok_or(GrpcPdCandidateError::Unavailable)?;
 
         let model = model_id;
 
@@ -455,7 +614,7 @@ impl WorkerSelectionStage {
             decode_policy.name(),
         );
 
-        Some((
+        Ok((
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
             target_runtime,
@@ -477,6 +636,28 @@ impl WorkerSelectionStage {
         rid_key: Option<&str>,
         encode_item_hashes: &[Vec<u8>],
     ) -> Option<EncodePrefillDecodeWorkerSelection> {
+        self.select_encode_prefill_decode_workers_inner(
+            model_id,
+            text,
+            tokens,
+            headers,
+            rid_key,
+            encode_item_hashes,
+            None,
+        )
+        .ok()
+    }
+
+    fn select_encode_prefill_decode_workers_inner(
+        &self,
+        model_id: &str,
+        text: Option<&str>,
+        tokens: Option<&[u32]>,
+        headers: Option<&HeaderMap>,
+        rid_key: Option<&str>,
+        encode_item_hashes: &[Vec<u8>],
+        capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<EncodePrefillDecodeWorkerSelection, GrpcPdCandidateError> {
         // All three legs derive from ONE membership snapshot (see
         // select_pd_pair). The pools are strictly gRPC — encode dispatch is
         // a gRPC encoder RPC the direct-ZMQ worker has no path for, and the
@@ -491,15 +672,15 @@ impl WorkerSelectionStage {
         let needs_encode = !encode_item_hashes.is_empty();
         if needs_encode && all_encode.is_empty() {
             warn!("No available encode workers");
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
         }
         if all_prefill.is_empty() {
             warn!("No available prefill workers");
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
         }
         if all_decode.is_empty() {
             warn!("No available decode workers");
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
         }
 
         // Disaggregated legs must share a runtime. Pick a runtime that has at
@@ -523,7 +704,7 @@ impl WorkerSelectionStage {
             })
         else {
             warn!("No available encode/prefill/decode worker set with a shared runtime");
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
         };
 
         let mixed = all_prefill
@@ -546,7 +727,7 @@ impl WorkerSelectionStage {
             .into_iter()
             .filter(|w| w.metadata().spec.runtime_type == target_runtime)
             .collect();
-        let available_prefill: Vec<_> = all_prefill
+        let mut available_prefill: Vec<_> = all_prefill
             .into_iter()
             .filter(|w| w.metadata().spec.runtime_type == target_runtime)
             .collect();
@@ -563,7 +744,19 @@ impl WorkerSelectionStage {
                 "No available encode/prefill/decode worker set for runtime {:?}",
                 target_runtime
             );
-            return None;
+            return Err(GrpcPdCandidateError::Unavailable);
+        }
+
+        if let Some(capacity) = capacity {
+            let had_available = !available_prefill.is_empty();
+            available_prefill.retain(|worker| capacity.has_capacity(worker));
+            if available_prefill.is_empty() {
+                return Err(if had_available {
+                    GrpcPdCandidateError::AtCapacity
+                } else {
+                    GrpcPdCandidateError::Unavailable
+                });
+            }
         }
 
         // Select encode, prefill, and decode via their per-role policies. Encode
@@ -585,13 +778,15 @@ impl WorkerSelectionStage {
             hash_ring: hash_ring.clone(),
             leg: WorkerLeg::Prefill,
         };
-        let prefill_idx =
-            self.policy_registry
-                .select_worker(&prefill_policy, &available_prefill, &info)?;
+        let prefill_idx = self
+            .policy_registry
+            .select_worker(&prefill_policy, &available_prefill, &info)
+            .ok_or(GrpcPdCandidateError::Unavailable)?;
         info.leg = WorkerLeg::Decode;
-        let decode_idx =
-            self.policy_registry
-                .select_worker(&decode_policy, &available_decode, &info)?;
+        let decode_idx = self
+            .policy_registry
+            .select_worker(&decode_policy, &available_decode, &info)
+            .ok_or(GrpcPdCandidateError::Unavailable)?;
 
         let encode_assignments = assign_encode_workers(
             &available_encode,
@@ -599,7 +794,8 @@ impl WorkerSelectionStage {
             model_id,
             encode_policy.as_ref(),
             hash_ring.clone(),
-        )?;
+        )
+        .ok_or(GrpcPdCandidateError::Unavailable)?;
 
         // Record worker selection metrics for prefill and decode, each tagged
         // with the policy that picked it. Encode item assignment metrics are
@@ -621,7 +817,7 @@ impl WorkerSelectionStage {
             decode_policy.name(),
         );
 
-        Some((
+        Ok((
             encode_assignments,
             available_prefill[prefill_idx].clone(),
             available_decode[decode_idx].clone(),
@@ -822,6 +1018,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
         assert!(stage
             .select_pd_pair(model_id, None, None, None, None)
@@ -873,6 +1070,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::EncodePrefillDecode,
+            None,
         );
 
         // No prefill/decode workers registered: with encode undemanded this is
@@ -897,6 +1095,7 @@ mod tests {
             Arc::new(WorkerRegistry::new()),
             Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin)),
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
         assert_eq!(
             stage
@@ -929,6 +1128,7 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
         let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
         assert_even_pd_round_robin_coverage(
@@ -961,6 +1161,7 @@ mod tests {
             worker_registry,
             policy_registry,
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
         let (prefill_hits, decode_hits) = count_select_pd_pair_hits(&stage, model_id, 40);
         assert_even_pd_round_robin_coverage(
@@ -999,6 +1200,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
 
         assert!(
@@ -1050,6 +1252,7 @@ mod tests {
             worker_registry,
             policy_registry.clone(),
             WorkerSelectionMode::Regular,
+            None,
         );
 
         let rid_key = policy_registry.derive_rid_key(Some("conv7_t1"));
@@ -1107,6 +1310,7 @@ mod tests {
             Arc::clone(&worker_registry),
             policy_registry,
             WorkerSelectionMode::Regular,
+            None,
         );
 
         assert!(stage

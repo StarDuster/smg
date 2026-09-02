@@ -244,6 +244,9 @@ class RouterArgs:
     # Most bytes the router may buffer for a request it holds only to keep
     # it retryable; larger eligible requests stream and forfeit router retries
     max_buffered_request_bytes: int = 1048576
+    prefill_max_inflight_requests_per_worker: int = -1
+    prefill_queue_size: int | None = None
+    prefill_queue_timeout_secs: int | None = None
 
     @staticmethod
     def add_cli_args(
@@ -802,6 +805,33 @@ class RouterArgs:
             action="append",
             metavar=("URL",),
             help="Decode server URL. Can be specified multiple times.",
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-max-inflight-requests-per-worker",
+            type=int,
+            default=RouterArgs.prefill_max_inflight_requests_per_worker,
+            help=(
+                "Maximum in-flight Prefill requests per worker in PD or EPD mode."
+                " A non-positive value disables the limit (default: -1)."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-size",
+            type=int,
+            default=RouterArgs.prefill_queue_size,
+            help=(
+                "Maximum number of requests waiting for Prefill admission."
+                " Defaults to 100 when Prefill admission is enabled; 0 disables waiting."
+            ),
+        )
+        pd_group.add_argument(
+            f"--{prefix}prefill-queue-timeout-secs",
+            type=int,
+            default=RouterArgs.prefill_queue_timeout_secs,
+            help=(
+                "Maximum time in seconds a request may wait for Prefill admission."
+                " Defaults to 60 when Prefill admission is enabled."
+            ),
         )
         pd_group.add_argument(
             f"--{prefix}worker-startup-timeout-secs",

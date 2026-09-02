@@ -33,7 +33,7 @@ use super::{
 };
 use crate::{
     middleware::TenantRequestMeta,
-    worker::{RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
+    worker::{PrefillLoadGuard, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry},
 };
 
 /// Main request processing context
@@ -190,6 +190,9 @@ pub(crate) struct ProcessingState {
 
     // Load guard for worker load tracking (created at execution stage)
     pub load_guards: Option<LoadGuards>,
+
+    /// Prefill admission reservation, created during worker selection for PD/EPD.
+    pub pd_prefill_guard: Option<PrefillLoadGuard>,
 
     // Stage 6: Response processing state
     pub response: ResponseState,
@@ -434,7 +437,7 @@ pub(crate) enum LoadGuards {
     /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
     /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
     Disaggregated {
-        _prefill: WorkerLoadGuard,
+        _prefill: PrefillLoadGuard,
         _decode: WorkerLoadGuard,
     },
     /// Batched completion fan-out: one guard set per sub-request so load-aware
@@ -450,12 +453,32 @@ impl LoadGuards {
             WorkerSelection::Single { worker } => LoadGuards::Single {
                 _guard: WorkerLoadGuard::with_key(worker.clone(), routing_key),
             },
-            WorkerSelection::Disaggregated {
-                prefill, decode, ..
-            } => LoadGuards::Disaggregated {
-                _prefill: WorkerLoadGuard::with_key(prefill.clone(), routing_key),
-                _decode: WorkerLoadGuard::with_key(decode.clone(), routing_key),
-            },
+            WorkerSelection::Disaggregated { .. } => {
+                panic!("PD/EPD load guards require the Prefill reservation from worker selection")
+            }
+        }
+    }
+
+    pub fn disaggregated(
+        prefill: PrefillLoadGuard,
+        decode: Arc<dyn Worker>,
+        routing_key: Option<&str>,
+        count: usize,
+    ) -> Self {
+        if count <= 1 {
+            Self::Disaggregated {
+                _prefill: prefill,
+                _decode: WorkerLoadGuard::with_key(decode, routing_key),
+            }
+        } else {
+            Self::Batch {
+                _guards: (0..count)
+                    .map(|_| Self::Disaggregated {
+                        _prefill: prefill.replicate(),
+                        _decode: WorkerLoadGuard::with_key(Arc::clone(&decode), routing_key),
+                    })
+                    .collect(),
+            }
         }
     }
 

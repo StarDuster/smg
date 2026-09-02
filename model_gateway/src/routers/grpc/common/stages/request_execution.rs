@@ -1,6 +1,6 @@
 //! Request execution stage: execute gRPC requests from an execution plan.
 
-use std::time::Instant;
+use std::{sync::Arc, time::Instant};
 
 use async_trait::async_trait;
 use axum::response::Response;
@@ -106,11 +106,29 @@ impl PipelineStage for RequestExecutionStage {
             ExecutionPlan::Batch { requests, .. } => requests.len(),
             _ => 1,
         };
-        ctx.state.load_guards = Some(LoadGuards::scaled(
-            workers,
-            ctx.state.sticky_key.as_deref(),
-            sub_requests,
-        ));
+        ctx.state.load_guards = Some(match workers {
+            WorkerSelection::Disaggregated { decode, .. } => {
+                let prefill_guard = ctx.state.pd_prefill_guard.take().ok_or_else(|| {
+                    error!(
+                        function = "RequestExecutionStage::execute",
+                        "Prefill admission reservation missing after PD worker selection"
+                    );
+                    error::internal_error(
+                        "prefill_admission_missing",
+                        "Prefill admission reservation missing after PD worker selection",
+                    )
+                })?;
+                LoadGuards::disaggregated(
+                    prefill_guard,
+                    Arc::clone(decode),
+                    ctx.state.sticky_key.as_deref(),
+                    sub_requests,
+                )
+            }
+            WorkerSelection::Single { .. } => {
+                LoadGuards::scaled(workers, ctx.state.sticky_key.as_deref(), sub_requests)
+            }
+        });
 
         // Extract dispatch metadata for tracing span
         let dispatch = ctx.state.dispatch.as_ref();

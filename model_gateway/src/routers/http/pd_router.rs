@@ -52,11 +52,12 @@ use crate::{
         error,
         grpc::utils::{error_type_from_status, route_to_endpoint},
         http::router::send_with_stale_conn_retry,
-        RouterTrait,
+        RouterTrait, PD_PREFILL_QUEUE_FULL, PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        HashRing, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
-        UNKNOWN_MODEL_ID,
+        acquire_prefill, HashRing, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
+        PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType,
+        Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
     },
 };
 
@@ -67,6 +68,18 @@ use crate::{
 /// [`PDRouter::handle_server_selection_error`].
 type PdPair = (Arc<dyn Worker>, Arc<dyn Worker>);
 
+struct AdmittedPdPair {
+    prefill: Arc<dyn Worker>,
+    decode: Arc<dyn Worker>,
+    prefill_guard: PrefillLoadGuard,
+    decode_guard: WorkerLoadGuard,
+}
+
+struct PdLoadGuards {
+    _prefill: PrefillLoadGuard,
+    _decode: WorkerLoadGuard,
+}
+
 #[derive(Debug)]
 enum PdSelectionFailure {
     /// Every worker on one leg is vetoed: a ready-made, already-counted 503.
@@ -74,15 +87,76 @@ enum PdSelectionFailure {
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
+    QueueFull,
+    QueueTimeout,
 }
 
 #[derive(Debug)]
+enum PdCandidateError {
+    Unavailable(String),
+    PrefillAtCapacity,
+    Shed(Response),
+}
+
+impl From<PrefillAdmissionRejection> for PdSelectionFailure {
+    fn from(value: PrefillAdmissionRejection) -> Self {
+        match value {
+            PrefillAdmissionRejection::QueueFull => Self::QueueFull,
+            PrefillAdmissionRejection::QueueTimeout => Self::QueueTimeout,
+            PrefillAdmissionRejection::Unavailable => {
+                Self::Unavailable("No available prefill and decode worker pair".to_string())
+            }
+        }
+    }
+}
+
+impl From<PdCandidateError> for PdSelectionFailure {
+    fn from(value: PdCandidateError) -> Self {
+        match value {
+            PdCandidateError::Unavailable(message) => Self::Unavailable(message),
+            PdCandidateError::PrefillAtCapacity => {
+                Self::Unavailable("No available prefill workers".to_string())
+            }
+            PdCandidateError::Shed(shed) => Self::Shed(shed),
+        }
+    }
+}
+
+impl From<PrefillAcquireError<PdCandidateError>> for PdSelectionFailure {
+    fn from(value: PrefillAcquireError<PdCandidateError>) -> Self {
+        match value {
+            PrefillAcquireError::Candidate(error) => error.into(),
+            PrefillAcquireError::Rejected(rejection) => rejection.into(),
+        }
+    }
+}
+
+impl PrefillCandidateError for PdCandidateError {
+    fn is_at_capacity(&self) -> bool {
+        matches!(self, Self::PrefillAtCapacity)
+    }
+}
+
 pub struct PDRouter {
     pub worker_registry: Arc<WorkerRegistry>,
     pub policy_registry: Arc<PolicyRegistry>,
     pub client: Client,
     pub retry_config: RetryConfig,
     pub api_key: Option<String>,
+    prefill_admission: Option<Arc<PrefillAdmission>>,
+}
+
+impl std::fmt::Debug for PDRouter {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PDRouter")
+            .field("retry_config", &self.retry_config)
+            .field("api_key", &self.api_key)
+            .field(
+                "prefill_admission_enabled",
+                &self.prefill_admission.is_some(),
+            )
+            .finish_non_exhaustive()
+    }
 }
 
 #[derive(Clone)]
@@ -204,7 +278,16 @@ impl PDRouter {
             client: ctx.client.clone(),
             retry_config: ctx.router_config.effective_retry_config(),
             api_key: ctx.router_config.api_key.clone(),
+            prefill_admission: ctx.prefill_admission.clone(),
         })
+    }
+
+    fn should_retry_pd_response(response: &Response) -> bool {
+        is_retryable_response(response)
+            && !matches!(
+                error::extract_error_code_from_response(response),
+                PD_PREFILL_QUEUE_FULL | PD_PREFILL_QUEUE_TIMEOUT
+            )
     }
 
     fn handle_server_selection_error(failure: PdSelectionFailure) -> Response {
@@ -213,6 +296,17 @@ impl PDRouter {
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
             PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::QueueFull => {
+                error!("Failed to select PD pair error=prefill admission queue is full");
+                error::too_many_requests(PD_PREFILL_QUEUE_FULL, "Prefill admission queue is full")
+            }
+            PdSelectionFailure::QueueTimeout => {
+                error!("Failed to select PD pair error=timed out waiting for Prefill admission");
+                error::too_many_requests(
+                    PD_PREFILL_QUEUE_TIMEOUT,
+                    "Timed out waiting for Prefill admission",
+                )
+            }
             PdSelectionFailure::Unavailable(error) => {
                 error!("Failed to select PD pair error={}", error);
                 error::service_unavailable(
@@ -235,6 +329,20 @@ impl PDRouter {
         match overload::shed_if_all_overloaded(candidates, model_id) {
             Some(shed) => PdSelectionFailure::Shed(shed),
             None => PdSelectionFailure::Unavailable(error),
+        }
+    }
+
+    fn candidate_leg_error(
+        candidates: &[Arc<dyn Worker>],
+        model_id: &str,
+        error: String,
+    ) -> PdCandidateError {
+        match Self::leg_failure(candidates, model_id, error) {
+            PdSelectionFailure::Unavailable(message) => PdCandidateError::Unavailable(message),
+            PdSelectionFailure::Shed(shed) => PdCandidateError::Shed(shed),
+            PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout => {
+                PdCandidateError::Unavailable("No available prefill and decode worker pair".into())
+            }
         }
     }
 
@@ -390,7 +498,7 @@ impl PDRouter {
                 .await;
             // Mirror the retry executor's exhaustion accounting for a
             // retryable response that gets no retry.
-            if is_retryable_response(&res) {
+            if Self::should_retry_pd_response(&res) {
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_PREFILL, endpoint);
                 Metrics::record_worker_retries_exhausted(metrics_labels::WORKER_DECODE, endpoint);
             }
@@ -410,7 +518,7 @@ impl PDRouter {
                         }
                     }
                 },
-                |res, _attempt| is_retryable_response(res),
+                |res, _attempt| Self::should_retry_pd_response(res),
                 |delay, attempt| {
                     // Layer 3 worker metrics (PD mode uses both prefill and decode workers)
                     Metrics::record_worker_retry(metrics_labels::WORKER_PREFILL, endpoint);
@@ -465,21 +573,38 @@ impl PDRouter {
         lease: &RequestLease<T>,
         context: PDRequestContext<'_>,
     ) -> Response {
-        let selected = lease.with_view(|view| {
-            self.select_pd_pair(
-                view.text,
-                view.tokens,
-                view.rid_key,
-                context.model_id,
-                context.headers.as_ref(),
+        let (request_text, tokens, rid_key) = lease.with_view(|view| {
+            (
+                view.text.map(str::to_string),
+                view.tokens.map(Vec::from),
+                view.rid_key.map(str::to_string),
             )
         });
-        let (prefill, decode) = match selected {
+        let sticky_key = rid_key
+            .as_deref()
+            .or_else(|| self.policy_registry.sticky_header_key(headers));
+        let admitted = match self
+            .select_pd_pair_with_admission(
+                request_text.as_deref(),
+                tokens.as_deref(),
+                rid_key.as_deref(),
+                context.model_id,
+                context.headers.as_ref(),
+                sticky_key,
+            )
+            .await
+        {
             Ok(pair) => pair,
             Err(e) => {
                 return Self::handle_server_selection_error(*e);
             }
         };
+        let AdmittedPdPair {
+            prefill,
+            decode,
+            prefill_guard,
+            decode_guard,
+        } = admitted;
 
         debug!(
             "PD retry attempt {} using prefill={} decode={}",
@@ -498,17 +623,10 @@ impl PDRouter {
 
         let raw_body_len = header_utils::content_length(headers);
 
-        // Keyed-load accounting uses the same effective key as selection:
-        // rid-derived first, header fallback. Built before the lease releases.
-        let load_guards = lease.with_view(|view| {
-            let key = view
-                .rid_key
-                .or_else(|| self.policy_registry.sticky_header_key(headers));
-            vec![
-                WorkerLoadGuard::with_key(prefill.clone(), key),
-                WorkerLoadGuard::with_key(decode.clone(), key),
-            ]
-        });
+        let load_guards = PdLoadGuards {
+            _prefill: prefill_guard,
+            _decode: decode_guard,
+        };
 
         if prefill.metadata().spec.runtime_type == RuntimeType::Vllm {
             // vLLM PD is sequential: prefill first with connector params, then
@@ -699,7 +817,7 @@ impl PDRouter {
         res: reqwest::Response,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        load_guards: PdLoadGuards,
     ) -> Response {
         let status = res.status();
 
@@ -815,7 +933,7 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        load_guards: PdLoadGuards,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
 
@@ -996,7 +1114,7 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        load_guards: PdLoadGuards,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
 
@@ -1244,7 +1362,7 @@ impl PDRouter {
         status: StatusCode,
         context: &PDRequestContext<'_>,
         decode: Arc<dyn Worker>,
-        load_guards: Vec<WorkerLoadGuard>,
+        load_guards: PdLoadGuards,
         prefill_body: Option<Bytes>,
     ) -> Response {
         if context.is_stream {
@@ -1313,6 +1431,44 @@ impl PDRouter {
         prefill_policy.needs_request_text() || decode_policy.needs_request_text()
     }
 
+    async fn select_pd_pair_with_admission(
+        &self,
+        request_text: Option<&str>,
+        tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
+        model_id: &str,
+        headers: Option<&HeaderMap>,
+        sticky_key: Option<&str>,
+    ) -> Result<AdmittedPdPair, Box<PdSelectionFailure>> {
+        debug!("Selecting admitted PD pair: model_id={:?}", model_id);
+
+        let ((prefill, decode), prefill_guard) = acquire_prefill(
+            self.prefill_admission.as_deref(),
+            sticky_key,
+            |(prefill, _): &PdPair| prefill,
+            |capacity| {
+                self.select_pd_candidate(
+                    request_text,
+                    tokens,
+                    rid_key,
+                    model_id,
+                    headers,
+                    capacity,
+                )
+            },
+        )
+        .await
+        .map_err(|error| Box::new(PdSelectionFailure::from(error)))?;
+        let decode_guard = WorkerLoadGuard::with_key(Arc::clone(&decode), sticky_key);
+
+        Ok(AdmittedPdPair {
+            prefill,
+            decode,
+            prefill_guard,
+            decode_guard,
+        })
+    }
+
     fn select_pd_pair(
         &self,
         request_text: Option<&str>,
@@ -1321,6 +1477,19 @@ impl PDRouter {
         model_id: &str,
         headers: Option<&HeaderMap>,
     ) -> Result<PdPair, Box<PdSelectionFailure>> {
+        self.select_pd_candidate(request_text, tokens, rid_key, model_id, headers, None)
+            .map_err(|error| Box::new(error.into()))
+    }
+
+    fn select_pd_candidate(
+        &self,
+        request_text: Option<&str>,
+        tokens: Option<&[u32]>,
+        rid_key: Option<&str>,
+        model_id: &str,
+        headers: Option<&HeaderMap>,
+        capacity: Option<&PrefillSelectionContext<'_>>,
+    ) -> Result<PdPair, PdCandidateError> {
         debug!("Selecting PD pair: model_id={:?}", model_id);
 
         // Shared HTTP-transport projections: this router proxies plain HTTP
@@ -1365,9 +1534,23 @@ impl PDRouter {
         // Get cached hash ring for consistent hashing
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
+        let mut prefill_candidates: Vec<Arc<dyn Worker>> = prefill_workers.iter().cloned().collect();
+        let targeted = prefill_policy.name() == "consistent_hashing"
+            && header_utils::extract_target_worker(headers).is_some();
+        if let Some(capacity) = capacity {
+            if !targeted {
+                let had_available = prefill_candidates.iter().any(|worker| worker.is_available());
+                prefill_candidates.retain(|worker| capacity.has_capacity(worker));
+                if had_available && !prefill_candidates.iter().any(|worker| worker.is_available())
+                {
+                    return Err(PdCandidateError::PrefillAtCapacity);
+                }
+            }
+        }
+
         let prefill = self
             .pick_worker_by_policy_arc(
-                &prefill_workers,
+                &prefill_candidates,
                 &prefill_policy,
                 request_text,
                 tokens,
@@ -1377,7 +1560,11 @@ impl PDRouter {
                 "prefill",
                 crate::policies::WorkerLeg::Prefill,
             )
-            .map_err(|e| Box::new(Self::leg_failure(&prefill_workers, model_id, e)))?;
+            .map_err(|e| Self::candidate_leg_error(&prefill_workers, model_id, e))?;
+
+        if capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
+            return Err(PdCandidateError::PrefillAtCapacity);
+        }
 
         let decode = self
             .pick_worker_by_policy_arc(
@@ -1391,7 +1578,7 @@ impl PDRouter {
                 "decode",
                 crate::policies::WorkerLeg::Decode,
             )
-            .map_err(|e| Box::new(Self::leg_failure(&decode_workers, model_id, e)))?;
+            .map_err(|e| Self::candidate_leg_error(&decode_workers, model_id, e))?;
 
         // Record worker selection metrics (Layer 3)
         let model = model_id;
@@ -1484,7 +1671,7 @@ impl PDRouter {
         return_logprob: bool,
         decode_url: Option<String>,
         headers: Option<HeaderMap>,
-        load_guards: Vec<WorkerLoadGuard>,
+        load_guards: PdLoadGuards,
     ) -> Response {
         use crate::worker::AttachedBody;
 
@@ -1862,6 +2049,18 @@ impl RouterTrait for PDRouter {
             // broken one already did.
             Err(failure) => match *failure {
                 PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::QueueFull => {
+                    return error::too_many_requests(
+                        PD_PREFILL_QUEUE_FULL,
+                        "Prefill admission queue is full",
+                    );
+                }
+                PdSelectionFailure::QueueTimeout => {
+                    return error::too_many_requests(
+                        PD_PREFILL_QUEUE_TIMEOUT,
+                        "Timed out waiting for Prefill admission",
+                    );
+                }
                 PdSelectionFailure::Unavailable(e) => {
                     return error::service_unavailable(
                         "no_healthy_worker_pair",
@@ -2207,6 +2406,7 @@ mod tests {
             client: Client::new(),
             retry_config: RetryConfig::default(),
             api_key: Some("test_api_key".to_string()),
+            prefill_admission: None,
         }
     }
 
@@ -2445,6 +2645,9 @@ mod tests {
                 assert!(error.contains("No prefill workers available"));
             }
             PdSelectionFailure::Shed(_) => panic!("an empty fleet is not an overload shed"),
+            PdSelectionFailure::QueueFull | PdSelectionFailure::QueueTimeout => {
+                panic!("an empty fleet is not a Prefill admission rejection")
+            }
         }
     }
 
@@ -2773,10 +2976,12 @@ mod tests {
             headers: None,
         };
 
-        let load_guards = vec![
-            WorkerLoadGuard::new(prefill.clone(), None),
-            WorkerLoadGuard::new(decode.clone(), None),
-        ];
+        let load_guards = PdLoadGuards {
+            _prefill: PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::new(prefill.clone(), None),
+            },
+            _decode: WorkerLoadGuard::new(decode.clone(), None),
+        };
 
         let response = router
             .handle_decode_error_response(decode_response, &context, decode, load_guards)
@@ -2894,10 +3099,12 @@ mod tests {
         let stream = ReceiverStream::new(rx);
 
         {
-            let guards = vec![
-                WorkerLoadGuard::new(prefill_ref.clone(), None),
-                WorkerLoadGuard::new(decode_ref.clone(), None),
-            ];
+            let guards = PdLoadGuards {
+                _prefill: PrefillLoadGuard::Unbounded {
+                    _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
+                },
+                _decode: WorkerLoadGuard::new(decode_ref.clone(), None),
+            };
 
             assert_eq!(prefill_ref.load(), 1);
             assert_eq!(decode_ref.load(), 1);
