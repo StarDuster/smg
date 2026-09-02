@@ -910,7 +910,7 @@ fn hex_encode(bytes: &[u8]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::{collections::HashMap, time::Duration};
 
     use axum::http::StatusCode;
     use openai_protocol::worker::HealthCheckConfig;
@@ -918,9 +918,10 @@ mod tests {
     use super::*;
     use crate::{
         config::types::PolicyConfig,
-        policies::PolicyFactory,
+        mesh::adapters::tree_sync::RepairEntry,
+        policies::{CacheAwareConfig, CacheAwarePolicy, PolicyFactory, TreeHandle, TreeKind},
         routers::common::retry::is_retryable_response,
-        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard},
+        worker::{BasicWorkerBuilder, ConnectionMode, ModelCard, PrefillAdmission},
     };
 
     fn no_health_check() -> HealthCheckConfig {
@@ -971,6 +972,75 @@ mod tests {
         (prefill_urls, decode_urls)
     }
 
+    fn worker_with_runtime(
+        url: &str,
+        worker_type: WorkerType,
+        runtime_type: RuntimeType,
+    ) -> Arc<dyn Worker> {
+        modeled_worker(url, "test-model", worker_type, runtime_type)
+    }
+
+    fn worker(url: &str, worker_type: WorkerType) -> Arc<dyn Worker> {
+        worker_with_runtime(url, worker_type, RuntimeType::Sglang)
+    }
+
+    fn modeled_worker(
+        url: &str,
+        model_id: &str,
+        worker_type: WorkerType,
+        runtime_type: RuntimeType,
+    ) -> Arc<dyn Worker> {
+        Arc::new(
+            BasicWorkerBuilder::new(url)
+                .model(ModelCard::new(model_id))
+                .worker_type(worker_type)
+                .connection_mode(ConnectionMode::Grpc)
+                .runtime_type(runtime_type)
+                .health_config(no_health_check())
+                .build(),
+        )
+    }
+
+    fn pd_stage(
+        worker_registry: Arc<WorkerRegistry>,
+        policy: PolicyConfig,
+        prefill_admission: Option<Arc<PrefillAdmission>>,
+    ) -> WorkerSelectionStage {
+        WorkerSelectionStage::new(
+            worker_registry,
+            Arc::new(PolicyRegistry::new(policy)),
+            WorkerSelectionMode::PrefillDecode,
+            prefill_admission,
+        )
+    }
+
+    fn token_tree_has_tenant(policy: &CacheAwarePolicy, tokens: &[u32], worker_url: &str) -> bool {
+        policy
+            .open_repair_stream("test-model", TreeKind::Token)
+            .expect("token tree should be initialized")
+            .any(|entry| {
+                matches!(
+                    entry,
+                    RepairEntry::Token {
+                        tokens: path,
+                        tenants,
+                    } if path == tokens
+                        && tenants
+                            .iter()
+                            .any(|(tenant, _)| tenant.as_ref() == worker_url)
+                )
+            })
+    }
+
+    async fn wait_for_queued(admission: &PrefillAdmission, expected: usize) {
+        for _ in 0..1_000 {
+            if admission.queued_requests() == expected {
+                return;
+            }
+            tokio::task::yield_now().await;
+        }
+    }
+
     fn hit_counts_in_order(urls: &[String], hits: &HashMap<String, usize>) -> Vec<usize> {
         urls.iter()
             .map(|url| hits.get(url).copied().unwrap_or(0))
@@ -1014,6 +1084,201 @@ mod tests {
             *decode_hits.entry(decode.url().to_string()).or_default() += 1;
         }
         (prefill_hits, decode_hits)
+    }
+
+    #[tokio::test]
+    async fn admission_filters_full_prefill_before_policy_selection() {
+        let model_id = "test-model";
+        let registry = Arc::new(WorkerRegistry::new());
+        let full = worker("grpc://prefill-full:30000", WorkerType::Prefill);
+        let available = worker("grpc://prefill-available:30000", WorkerType::Prefill);
+        let decode = worker("grpc://decode:30000", WorkerType::Decode);
+        for worker in [&full, &available, &decode] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+
+        let admission = Arc::new(PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+        let occupied = match admission
+            .admit(None, {
+                let full = Arc::clone(&full);
+                move |capacity| capacity.select(Arc::clone(&full), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("initial prefill admission should succeed"),
+        };
+        let stage = pd_stage(
+            registry,
+            PolicyConfig::RoundRobin,
+            Some(Arc::clone(&admission)),
+        );
+
+        let (prefill, selected_decode, _, guard) = match stage
+            .admit_pd_pair(model_id, None, None, None, None, None)
+            .await
+        {
+            Ok(selection) => selection,
+            Err(_) => panic!("admission should select the non-full prefill worker"),
+        };
+
+        assert_eq!(prefill.url(), available.url());
+        assert_eq!(selected_decode.url(), decode.url());
+        assert_eq!(full.load(), 1);
+        assert_eq!(available.load(), 1);
+        assert_eq!(decode.load(), 0);
+        drop(guard);
+        drop(occupied);
+        assert_eq!(full.load(), 0);
+        assert_eq!(available.load(), 0);
+    }
+
+    #[tokio::test]
+    async fn queued_cache_aware_request_commits_only_after_final_worker_selection() {
+        let model_id = "test-model";
+        let registry = Arc::new(WorkerRegistry::new());
+        let first = worker("grpc://prefill-cache-1:30000", WorkerType::Prefill);
+        let second = worker("grpc://prefill-cache-2:30000", WorkerType::Prefill);
+        let decode = worker("grpc://decode-cache:30000", WorkerType::Decode);
+        for worker in [&first, &second, &decode] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+
+        let cache_policy = Arc::new(CacheAwarePolicy::with_config(CacheAwareConfig {
+            eviction_interval_secs: 0,
+            ..Default::default()
+        }));
+        cache_policy.init_workers(&[Arc::clone(&first), Arc::clone(&second)]);
+        let policy_registry = Arc::new(PolicyRegistry::new(PolicyConfig::RoundRobin));
+        policy_registry.set_prefill_policy(cache_policy.clone());
+
+        let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(5)));
+        let occupied_first = match admission
+            .admit(None, {
+                let first = Arc::clone(&first);
+                move |capacity| capacity.select(Arc::clone(&first), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("first admission should succeed"),
+        };
+        let occupied_second = match admission
+            .admit(None, {
+                let second = Arc::clone(&second);
+                move |capacity| capacity.select(Arc::clone(&second), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("second admission should succeed"),
+        };
+        let stage = Arc::new(WorkerSelectionStage::new(
+            registry,
+            policy_registry,
+            WorkerSelectionMode::PrefillDecode,
+            Some(Arc::clone(&admission)),
+        ));
+        let tokens: Vec<u32> = (1..=16).collect();
+
+        #[expect(
+            clippy::disallowed_methods,
+            reason = "test waiter task is joined before the test ends"
+        )]
+        let queued = tokio::spawn({
+            let stage = Arc::clone(&stage);
+            let tokens = tokens.clone();
+            async move {
+                stage
+                    .admit_pd_pair(model_id, None, Some(&tokens), None, None, None)
+                    .await
+            }
+        });
+        wait_for_queued(&admission, 1).await;
+        assert_eq!(admission.queued_requests(), 1);
+        assert_eq!(first.processed_requests(), 0);
+        assert_eq!(second.processed_requests(), 0);
+        assert!(!token_tree_has_tenant(&cache_policy, &tokens, first.url()));
+        assert!(!token_tree_has_tenant(&cache_policy, &tokens, second.url()));
+
+        drop(occupied_second);
+        let (selected_prefill, _, _, guard) = match queued.await.expect("waiter should join") {
+            Ok(selection) => selection,
+            Err(_) => panic!("queued admission should complete after capacity frees"),
+        };
+
+        assert_eq!(selected_prefill.url(), second.url());
+        assert_eq!(first.processed_requests(), 0);
+        assert_eq!(second.processed_requests(), 1);
+        assert!(!token_tree_has_tenant(&cache_policy, &tokens, first.url()));
+        assert!(token_tree_has_tenant(&cache_policy, &tokens, second.url()));
+
+        drop(guard);
+        drop(occupied_first);
+    }
+
+    #[tokio::test]
+    async fn admission_does_not_reassign_a_full_explicit_target() {
+        let model_id = "test-model";
+        let registry = Arc::new(WorkerRegistry::new());
+        let first = worker("grpc://prefill-1:30000", WorkerType::Prefill);
+        let second = worker("grpc://prefill-2:30000", WorkerType::Prefill);
+        let decode = worker("grpc://decode:30000", WorkerType::Decode);
+        for worker in [&first, &second, &decode] {
+            registry.register(Arc::clone(worker)).unwrap();
+        }
+
+        let ordered_prefill: Vec<_> = registry
+            .get_workers_filtered(
+                Some(model_id),
+                Some(WorkerType::Prefill),
+                Some(ConnectionMode::Grpc),
+                Some(RuntimeType::Sglang),
+                false,
+            )
+            .into_iter()
+            .filter(|worker| worker.is_available())
+            .collect();
+        assert_eq!(ordered_prefill.len(), 2);
+        let target = Arc::clone(&ordered_prefill[0]);
+        let alternative = Arc::clone(&ordered_prefill[1]);
+
+        let admission = Arc::new(PrefillAdmission::new(1, 0, Duration::from_secs(1)));
+        let occupied = match admission
+            .admit(None, {
+                let target = Arc::clone(&target);
+                move |capacity| capacity.select(Arc::clone(&target), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("target admission should succeed"),
+        };
+        let stage = pd_stage(
+            registry,
+            PolicyConfig::ConsistentHashing,
+            Some(Arc::clone(&admission)),
+        );
+        let mut headers = HeaderMap::new();
+        headers.insert("x-smg-target-worker", "0".parse().unwrap());
+
+        let response = match stage
+            .admit_pd_pair(model_id, None, None, Some(&headers), None, None)
+            .await
+        {
+            Ok(_) => panic!("full explicit target must wait or reject, not reassign"),
+            Err(response) => response,
+        };
+
+        assert_eq!(response.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert_eq!(
+            error::extract_error_code_from_response(&response),
+            PD_PREFILL_QUEUE_FULL
+        );
+        assert_eq!(target.load(), 1);
+        assert_eq!(alternative.load(), 0);
+        assert_eq!(decode.load(), 0);
+        drop(occupied);
     }
 
     /// A saturated prefill leg is a pressure condition, not model absence.

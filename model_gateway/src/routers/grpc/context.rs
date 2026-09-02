@@ -1048,6 +1048,100 @@ mod tests {
         assert_eq!(decode.load(), 0);
     }
 
+    #[tokio::test]
+    async fn batch_prompts_preserve_phase_load_semantics() {
+        use crate::worker::{BasicWorkerBuilder, PrefillAdmission, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill:30000")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode:30000")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+        let routing_key = "batch-key";
+
+        let admission = PrefillAdmission::new(1, 0, std::time::Duration::from_secs(1));
+        let admitted = match admission
+            .admit(Some(routing_key), {
+                let prefill = Arc::clone(&prefill);
+                move |capacity| capacity.select(Arc::clone(&prefill), ())
+            })
+            .await
+        {
+            Ok(admitted) => admitted,
+            Err(_) => panic!("initial admission should succeed"),
+        };
+        let prefill_guard = PrefillLoadGuard::Admission {
+            _reservation: Arc::new(admitted.reservation),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children = match LoadGuards::disaggregated(
+            Arc::clone(&decode),
+            Some(routing_key),
+            3,
+        ) {
+            LoadGuards::Batch { _guards: guards } => guards,
+            _ => panic!("count > 1 should create batch guards"),
+        };
+
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 1);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::with_key(Arc::clone(&prefill), Some(routing_key)),
+        };
+        let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
+        prefill_children.push(prefill_guard);
+        let mut decode_children = match LoadGuards::disaggregated(
+            Arc::clone(&decode),
+            Some(routing_key),
+            3,
+        ) {
+            LoadGuards::Batch { _guards: guards } => guards,
+            _ => panic!("count > 1 should create batch guards"),
+        };
+
+        assert_eq!(prefill.load(), 3);
+        assert_eq!(decode.load(), 3);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children.pop());
+        drop(decode_children.pop());
+        assert_eq!(prefill.load(), 2);
+        assert_eq!(decode.load(), 2);
+        assert_eq!(prefill.routing_key_load(), 1);
+        assert_eq!(decode.routing_key_load(), 1);
+
+        drop(prefill_children);
+        drop(decode_children);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 0);
+        assert_eq!(prefill.routing_key_load(), 0);
+        assert_eq!(decode.routing_key_load(), 0);
+    }
+
     #[test]
     fn completion_preparation_routes_by_first_item_or_joined_text() {
         let scalar = completion_prep(&["hello"], None);
