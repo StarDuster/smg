@@ -428,6 +428,10 @@ impl WorkerSelectionStage {
         Ok((prefill, decode, runtime_type, guard))
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "EPD selection passes independent request and routing dimensions"
+    )]
     async fn admit_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -475,6 +479,7 @@ impl WorkerSelectionStage {
         Ok((encode_assignments, prefill, decode, runtime_type, guard))
     }
 
+    #[cfg(test)]
     fn select_pd_pair(
         &self,
         model_id: &str,
@@ -640,6 +645,7 @@ impl WorkerSelectionStage {
     /// encode worker. prefill+decode are selected as a normal PD pair. All pools
     /// are filtered to a runtime shared by the selected encode/prefill/decode
     /// legs.
+    #[cfg(test)]
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,
@@ -661,6 +667,10 @@ impl WorkerSelectionStage {
         .ok()
     }
 
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "EPD candidate selection needs all routing inputs plus capacity view"
+    )]
     fn select_encode_prefill_decode_workers_inner(
         &self,
         model_id: &str,

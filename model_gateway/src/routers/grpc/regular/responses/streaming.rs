@@ -49,6 +49,7 @@ use crate::{
             openai_bridge::{self, ResponseFormat},
             sse::{sse_channel, SseSender},
         },
+        error,
         grpc::{
             common::responses::{
                 await_stream_startup, build_sse_response, persist_response_if_needed,
@@ -565,11 +566,8 @@ async fn execute_tool_loop_streaming_internal(
             Err(e) => {
                 let message = format!("Failed to convert request: {e}");
                 if startup.is_some() {
-                    let response = crate::routers::error::bad_request(
-                        "convert_request_failed",
-                        message.clone(),
-                    );
-                    signal_stream_startup(&mut startup, Err(response));
+                    let response = error::bad_request("convert_request_failed", message.clone());
+                    let _ = signal_stream_startup(&mut startup, Err(response));
                     return Ok(());
                 }
                 return Err(message);

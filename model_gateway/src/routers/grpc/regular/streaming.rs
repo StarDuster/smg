@@ -1082,6 +1082,10 @@ impl StreamingProcessor {
     }
 
     /// Process prefill/decode streaming for generate endpoint (PD mode with logprobs support)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "streaming PD generate keeps phase streams, metadata, guards and reservation separate"
+    )]
     async fn process_generate_prefill_decode_streaming(
         tokenizer: Arc<dyn Tokenizer>,
         mut prefill_stream: ProtoStream,

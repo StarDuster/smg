@@ -1834,7 +1834,7 @@ impl WorkerLoadGuard {
         max: usize,
     ) -> Option<Self> {
         let key = extract_routing_key(headers);
-        Self::try_new_with_key(worker, key.as_deref(), max)
+        Self::try_new_with_key(worker, key, max)
     }
 
     pub fn try_new_with_key(

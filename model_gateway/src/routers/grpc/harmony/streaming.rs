@@ -212,6 +212,10 @@ impl HarmonyStreamingProcessor {
     }
 
     /// Process streaming chunks from prefill/decode streams (prefill + decode)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "streaming PD chat keeps phase streams, metadata, guards and reservation separate"
+    )]
     async fn process_prefill_decode_stream(
         mut prefill_stream: ProtoStream,
         decode_stream: ProtoStream,

@@ -96,6 +96,10 @@ pub(crate) struct PipelineDeps {
 impl PipelineDeps {
     /// Full deps for the chat/messages/harmony endpoints, which consume the
     /// configured parser factories/overrides.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "pipeline construction wires the endpoint dependency bundle"
+    )]
     pub(crate) fn new(
         worker_registry: Arc<WorkerRegistry>,
         policy_registry: Arc<PolicyRegistry>,
@@ -460,6 +464,10 @@ impl RequestPipeline {
     }
 
     /// Execute the complete pipeline for a chat request
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "chat execution is the shared entrypoint used by router retries and Responses"
+    )]
     pub async fn execute_chat(
         &self,
         request: Arc<ChatCompletionRequest>,
@@ -535,7 +543,7 @@ impl RequestPipeline {
                         response.status()
                     );
                     if stream_start.is_some() {
-                        signal_stream_startup(&mut stream_start, Err(response));
+                        let _ = signal_stream_startup(&mut stream_start, Err(response));
                         return error::internal_error(
                             "responses_stream_startup_failed",
                             "Streaming response failed before backend request startup",
@@ -1300,7 +1308,7 @@ impl RequestPipeline {
                         response.status()
                     );
                     if stream_start.is_some() {
-                        signal_stream_startup(&mut stream_start, Err(response));
+                        let _ = signal_stream_startup(&mut stream_start, Err(response));
                         return Err(error::internal_error(
                             "responses_stream_startup_failed",
                             "Streaming response failed before backend request startup",

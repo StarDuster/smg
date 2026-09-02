@@ -83,7 +83,7 @@ struct PdLoadGuards {
 #[derive(Debug)]
 enum PdSelectionFailure {
     /// Every worker on one leg is vetoed: a ready-made, already-counted 503.
-    Shed(Response),
+    Shed(Box<Response>),
     /// The pre-existing string: no workers configured, all unhealthy or
     /// circuit-broken, or the policy declined.
     Unavailable(String),
@@ -95,7 +95,7 @@ enum PdSelectionFailure {
 enum PdCandidateError {
     Unavailable(String),
     PrefillAtCapacity,
-    Shed(Response),
+    Shed(Box<Response>),
 }
 
 impl From<PrefillAdmissionRejection> for PdSelectionFailure {
@@ -295,7 +295,7 @@ impl PDRouter {
             // Already a decision-logged 503 with the overload error code and
             // counter; re-describing it as a circuit-breaker/health failure is
             // exactly the misdiagnosis this path used to hand operators.
-            PdSelectionFailure::Shed(shed) => shed,
+            PdSelectionFailure::Shed(shed) => *shed,
             PdSelectionFailure::QueueFull => {
                 error!("Failed to select PD pair error=prefill admission queue is full");
                 error::too_many_requests(PD_PREFILL_QUEUE_FULL, "Prefill admission queue is full")
@@ -327,7 +327,7 @@ impl PDRouter {
         error: String,
     ) -> PdSelectionFailure {
         match overload::shed_if_all_overloaded(candidates, model_id) {
-            Some(shed) => PdSelectionFailure::Shed(shed),
+            Some(shed) => PdSelectionFailure::Shed(Box::new(shed)),
             None => PdSelectionFailure::Unavailable(error),
         }
     }
@@ -927,6 +927,10 @@ impl PDRouter {
     }
 
     // Internal method that performs the actual dual dispatch (without retry logic)
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "dual dispatch needs both leg bodies plus selected workers, prefill guard and decode guard"
+    )]
     async fn execute_dual_dispatch_internal(
         &self,
         headers: Option<&HeaderMap>,
@@ -2053,7 +2057,7 @@ impl RouterTrait for PDRouter {
             // an all-vetoed fleet fails the probe, exactly as an all-circuit-
             // broken one already did.
             Err(failure) => match *failure {
-                PdSelectionFailure::Shed(shed) => return shed,
+                PdSelectionFailure::Shed(shed) => return *shed,
                 PdSelectionFailure::QueueFull => {
                     return error::too_many_requests(
                         PD_PREFILL_QUEUE_FULL,

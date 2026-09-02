@@ -447,6 +447,10 @@ pub(crate) enum LoadGuards {
 }
 
 impl LoadGuards {
+    #[expect(
+        clippy::panic,
+        reason = "PD callers must use disaggregated() with an admission reservation"
+    )]
     pub fn new(selection: &WorkerSelection, routing_key: Option<&str>) -> Self {
         match selection {
             WorkerSelection::Single { worker } => LoadGuards::Single {
