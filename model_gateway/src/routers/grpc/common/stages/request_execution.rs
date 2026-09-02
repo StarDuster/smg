@@ -234,6 +234,10 @@ impl PipelineStage for RequestExecutionStage {
     fn name(&self) -> &'static str {
         "RequestExecution"
     }
+
+    fn begins_backend_dispatch(&self) -> bool {
+        true
+    }
 }
 
 impl RequestExecutionStage {

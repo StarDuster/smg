@@ -598,6 +598,7 @@ impl GrpcRouter {
                             components,
                             Some(tenant_meta),
                             Some(rate_limit_cell),
+                            None,
                         )
                         .await
                 }

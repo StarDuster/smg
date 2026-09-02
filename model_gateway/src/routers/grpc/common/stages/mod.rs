@@ -25,6 +25,12 @@ pub trait PipelineStage: Send + Sync {
     /// Stage name for logging
     fn name(&self) -> &'static str;
 
+    /// True for the stage that starts the backend request. Streaming wrappers
+    /// use this as the point where returning HTTP 200 SSE becomes safe.
+    fn begins_backend_dispatch(&self) -> bool {
+        false
+    }
+
     /// Stable descriptor of the stage plus its mode-bearing args, compared
     /// against golden literals in the pipeline parity test. Stages whose
     /// construction args vary by mode override this to include them; the default

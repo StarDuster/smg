@@ -21,7 +21,10 @@ use tracing::{debug, error};
 // Import embedding-specific, classify-specific, messages-specific, and completion-specific stages
 use super::regular::stages::classify::ClassifyResponseProcessingStage;
 use super::{
-    common::{responses::ResponsesContext, stages::*},
+    common::{
+        responses::{signal_stream_startup, ResponsesContext, StreamStartupSender},
+        stages::*,
+    },
     context::*,
     harmony,
     mode::Mode,
@@ -465,6 +468,7 @@ impl RequestPipeline {
         components: Arc<SharedComponents>,
         tenant_request_meta: Option<TenantRequestMeta>,
         rate_limit_cell: Option<Arc<RateLimitCell>>,
+        mut stream_start: Option<StreamStartupSender>,
     ) -> Response {
         let start = Instant::now();
         let streaming = request.stream;
@@ -484,8 +488,15 @@ impl RequestPipeline {
         );
 
         for stage in self.stages.iter() {
+            let begins_backend_dispatch = stage.begins_backend_dispatch();
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
+                    if begins_backend_dispatch
+                        && stream_start.is_some()
+                        && !signal_stream_startup(&mut stream_start, Ok(()))
+                    {
+                        return response;
+                    }
                     // Stage completed with streaming response - record success and return
                     Metrics::record_router_duration(
                         metrics_labels::ROUTER_GRPC,
@@ -497,7 +508,18 @@ impl RequestPipeline {
                     );
                     return response;
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    if begins_backend_dispatch
+                        && stream_start.is_some()
+                        && !signal_stream_startup(&mut stream_start, Ok(()))
+                    {
+                        return error::internal_error(
+                            "responses_stream_startup_abandoned",
+                            "Streaming response startup receiver was dropped",
+                        );
+                    }
+                    continue;
+                }
                 Err(response) => {
                     Metrics::record_router_error(
                         metrics_labels::ROUTER_GRPC,
@@ -512,6 +534,13 @@ impl RequestPipeline {
                         stage.name(),
                         response.status()
                     );
+                    if stream_start.is_some() {
+                        signal_stream_startup(&mut stream_start, Err(response));
+                        return error::internal_error(
+                            "responses_stream_startup_failed",
+                            "Streaming response failed before backend request startup",
+                        );
+                    }
                     return response;
                 }
             }
@@ -1220,6 +1249,7 @@ impl RequestPipeline {
         request: &openai_protocol::responses::ResponsesRequest,
         harmony_ctx: &ResponsesContext,
         tenant_request_meta: Option<TenantRequestMeta>,
+        mut stream_start: Option<StreamStartupSender>,
     ) -> Result<(ExecutionResult, Option<LoadGuards>), Response> {
         // Create RequestContext for this Responses request
         let mut ctx = RequestContext::for_responses(
@@ -1231,6 +1261,7 @@ impl RequestPipeline {
         ctx.input.tenant_request_meta = tenant_request_meta;
 
         for (idx, stage) in self.stages.iter().enumerate() {
+            let begins_backend_dispatch = stage.begins_backend_dispatch();
             match stage.execute(&mut ctx).await {
                 Ok(Some(response)) => {
                     error!(
@@ -1238,9 +1269,29 @@ impl RequestPipeline {
                         idx + 1,
                         stage.name()
                     );
+                    if begins_backend_dispatch
+                        && stream_start.is_some()
+                        && !signal_stream_startup(&mut stream_start, Ok(()))
+                    {
+                        return Err(error::internal_error(
+                            "responses_stream_startup_abandoned",
+                            "Streaming response startup receiver was dropped",
+                        ));
+                    }
                     return Err(response);
                 }
-                Ok(None) => continue,
+                Ok(None) => {
+                    if begins_backend_dispatch
+                        && stream_start.is_some()
+                        && !signal_stream_startup(&mut stream_start, Ok(()))
+                    {
+                        return Err(error::internal_error(
+                            "responses_stream_startup_abandoned",
+                            "Streaming response startup receiver was dropped",
+                        ));
+                    }
+                    continue;
+                }
                 Err(response) => {
                     error!(
                         "Stage {} ({}) failed with status {}",
@@ -1248,6 +1299,13 @@ impl RequestPipeline {
                         stage.name(),
                         response.status()
                     );
+                    if stream_start.is_some() {
+                        signal_stream_startup(&mut stream_start, Err(response));
+                        return Err(error::internal_error(
+                            "responses_stream_startup_failed",
+                            "Streaming response failed before backend request startup",
+                        ));
+                    }
                     return Err(response);
                 }
             }
