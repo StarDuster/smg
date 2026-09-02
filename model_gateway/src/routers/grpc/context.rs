@@ -458,11 +458,7 @@ impl LoadGuards {
         }
     }
 
-    pub fn disaggregated(
-        decode: Arc<dyn Worker>,
-        routing_key: Option<&str>,
-        count: usize,
-    ) -> Self {
+    pub fn disaggregated(decode: Arc<dyn Worker>, routing_key: Option<&str>, count: usize) -> Self {
         if count <= 1 {
             Self::Disaggregated {
                 _decode: WorkerLoadGuard::with_key(decode, routing_key),
@@ -1080,14 +1076,11 @@ mod tests {
         };
         let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
         prefill_children.push(prefill_guard);
-        let mut decode_children = match LoadGuards::disaggregated(
-            Arc::clone(&decode),
-            Some(routing_key),
-            3,
-        ) {
-            LoadGuards::Batch { _guards: guards } => guards,
-            _ => panic!("count > 1 should create batch guards"),
-        };
+        let mut decode_children =
+            match LoadGuards::disaggregated(Arc::clone(&decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
 
         assert_eq!(prefill.load(), 1);
         assert_eq!(decode.load(), 3);
@@ -1113,14 +1106,11 @@ mod tests {
         };
         let mut prefill_children = vec![prefill_guard.replicate(), prefill_guard.replicate()];
         prefill_children.push(prefill_guard);
-        let mut decode_children = match LoadGuards::disaggregated(
-            Arc::clone(&decode),
-            Some(routing_key),
-            3,
-        ) {
-            LoadGuards::Batch { _guards: guards } => guards,
-            _ => panic!("count > 1 should create batch guards"),
-        };
+        let mut decode_children =
+            match LoadGuards::disaggregated(Arc::clone(&decode), Some(routing_key), 3) {
+                LoadGuards::Batch { _guards: guards } => guards,
+                _ => panic!("count > 1 should create batch guards"),
+            };
 
         assert_eq!(prefill.load(), 3);
         assert_eq!(decode.load(), 3);

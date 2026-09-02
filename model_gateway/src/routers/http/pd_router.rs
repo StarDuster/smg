@@ -55,9 +55,10 @@ use crate::{
         RouterTrait, PD_PREFILL_QUEUE_FULL, PD_PREFILL_QUEUE_TIMEOUT,
     },
     worker::{
-        acquire_prefill, HashRing, PrefillAcquireError, PrefillAdmission, PrefillAdmissionRejection,
-        PrefillCandidateError, PrefillLoadGuard, PrefillSelectionContext, RoutingPool, RuntimeType,
-        Worker, WorkerLoadGuard, WorkerRegistry, UNKNOWN_MODEL_ID,
+        acquire_prefill, HashRing, PrefillAcquireError, PrefillAdmission,
+        PrefillAdmissionRejection, PrefillCandidateError, PrefillLoadGuard,
+        PrefillSelectionContext, RoutingPool, RuntimeType, Worker, WorkerLoadGuard, WorkerRegistry,
+        UNKNOWN_MODEL_ID,
     },
 };
 
@@ -1452,14 +1453,7 @@ impl PDRouter {
             sticky_key,
             |(prefill, _): &PdPair| prefill,
             |capacity| {
-                self.select_pd_candidate(
-                    request_text,
-                    tokens,
-                    rid_key,
-                    model_id,
-                    headers,
-                    capacity,
-                )
+                self.select_pd_candidate(request_text, tokens, rid_key, model_id, headers, capacity)
             },
         )
         .await
@@ -1539,14 +1533,20 @@ impl PDRouter {
         // Get cached hash ring for consistent hashing
         let hash_ring = self.worker_registry.get_hash_ring(model_id);
 
-        let mut prefill_candidates: Vec<Arc<dyn Worker>> = prefill_workers.iter().cloned().collect();
+        let mut prefill_candidates: Vec<Arc<dyn Worker>> =
+            prefill_workers.iter().cloned().collect();
         let targeted = prefill_policy.name() == "consistent_hashing"
             && header_utils::extract_target_worker(headers).is_some();
         if let Some(capacity) = capacity {
             if !targeted {
-                let had_available = prefill_candidates.iter().any(|worker| worker.is_available());
+                let had_available = prefill_candidates
+                    .iter()
+                    .any(|worker| worker.is_available());
                 prefill_candidates.retain(|worker| capacity.has_capacity(worker));
-                if had_available && !prefill_candidates.iter().any(|worker| worker.is_available())
+                if had_available
+                    && !prefill_candidates
+                        .iter()
+                        .any(|worker| worker.is_available())
                 {
                     return Err(PdCandidateError::PrefillAtCapacity);
                 }

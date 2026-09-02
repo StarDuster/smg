@@ -22,11 +22,11 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::routers::{
-    error,
     common::{
         openai_bridge::{self, descriptor, ResponseFormat},
         sse::{SseReceiver, SseSender},
     },
+    error,
     grpc::harmony::responses::ToolResult,
 };
 
@@ -975,7 +975,6 @@ impl ResponseStreamEventEmitter {
     }
 }
 
-
 /// One-shot signal used by streaming `/v1/responses` handlers to avoid
 /// returning HTTP 200 until the first backend request has actually started.
 pub(crate) type StreamStartupSender = oneshot::Sender<Result<(), Response>>;
@@ -1106,7 +1105,9 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(
             response.headers().get(CONTENT_TYPE),
-            Some(&HeaderValue::from_static("text/event-stream; charset=utf-8"))
+            Some(&HeaderValue::from_static(
+                "text/event-stream; charset=utf-8"
+            ))
         );
     }
 }

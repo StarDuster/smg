@@ -404,20 +404,26 @@ impl WorkerSelectionStage {
         headers: Option<&HeaderMap>,
         rid_key: Option<&str>,
         sticky_key: Option<&str>,
-    ) -> Result<(Arc<dyn Worker>, Arc<dyn Worker>, RuntimeType, PrefillLoadGuard), Response> {
+    ) -> Result<
+        (
+            Arc<dyn Worker>,
+            Arc<dyn Worker>,
+            RuntimeType,
+            PrefillLoadGuard,
+        ),
+        Response,
+    > {
         let ((prefill, decode, runtime_type), guard) = acquire_prefill(
             self.prefill_admission.as_deref(),
             sticky_key,
             |(prefill, _, _): &PdWorkerPair| prefill,
-            |capacity| self.select_pd_pair_inner(model_id, text, tokens, headers, rid_key, capacity),
+            |capacity| {
+                self.select_pd_pair_inner(model_id, text, tokens, headers, rid_key, capacity)
+            },
         )
         .await
         .map_err(|error| {
-            self.admission_response(
-                model_id,
-                &[WorkerType::Prefill, WorkerType::Decode],
-                error,
-            )
+            self.admission_response(model_id, &[WorkerType::Prefill, WorkerType::Decode], error)
         })?;
         Ok((prefill, decode, runtime_type, guard))
     }
