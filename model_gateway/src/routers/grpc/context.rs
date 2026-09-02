@@ -434,10 +434,9 @@ pub(crate) enum LoadGuards {
     Single {
         _guard: WorkerLoadGuard,
     },
-    /// Disaggregated guards cover the prefill+decode pair. EPD encode workers are
-    /// assigned per item; their fire-and-supervise RPCs do not hold load guards.
+    /// Disaggregated guards cover the decode leg. The Prefill reservation
+    /// is held by the Prefill stream and drops when that phase ends.
     Disaggregated {
-        _prefill: PrefillLoadGuard,
         _decode: WorkerLoadGuard,
     },
     /// Batched completion fan-out: one guard set per sub-request so load-aware
@@ -460,21 +459,18 @@ impl LoadGuards {
     }
 
     pub fn disaggregated(
-        prefill: PrefillLoadGuard,
         decode: Arc<dyn Worker>,
         routing_key: Option<&str>,
         count: usize,
     ) -> Self {
         if count <= 1 {
             Self::Disaggregated {
-                _prefill: prefill,
                 _decode: WorkerLoadGuard::with_key(decode, routing_key),
             }
         } else {
             Self::Batch {
                 _guards: (0..count)
                     .map(|_| Self::Disaggregated {
-                        _prefill: prefill.replicate(),
                         _decode: WorkerLoadGuard::with_key(Arc::clone(&decode), routing_key),
                     })
                     .collect(),
@@ -966,6 +962,7 @@ pub(crate) enum ExecutionResult {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        prefill_guard: Option<PrefillLoadGuard>,
         /// PD timing context, for honest PD TTFT (prefill start to first decode token).
         pd_timing: PdTiming,
     },
@@ -1021,6 +1018,34 @@ mod tests {
                 .collect(),
             joined_routing_text: joined.map(str::to_string),
         }
+    }
+
+    #[test]
+    fn disaggregated_load_guards_hold_decode_only() {
+        use crate::worker::{BasicWorkerBuilder, WorkerType};
+
+        let prefill: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://prefill-load")
+                .worker_type(WorkerType::Prefill)
+                .build(),
+        );
+        let decode: Arc<dyn Worker> = Arc::new(
+            BasicWorkerBuilder::new("grpc://decode-load")
+                .worker_type(WorkerType::Decode)
+                .build(),
+        );
+
+        let prefill_guard = PrefillLoadGuard::Unbounded {
+            _guard: WorkerLoadGuard::new(Arc::clone(&prefill), None),
+        };
+        assert_eq!(prefill.load(), 1);
+        drop(prefill_guard);
+
+        let guards = LoadGuards::disaggregated(Arc::clone(&decode), None, 1);
+        assert_eq!(prefill.load(), 0);
+        assert_eq!(decode.load(), 1);
+        drop(guards);
+        assert_eq!(decode.load(), 0);
     }
 
     #[test]

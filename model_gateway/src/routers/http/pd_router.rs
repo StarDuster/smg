@@ -76,7 +76,6 @@ struct AdmittedPdPair {
 }
 
 struct PdLoadGuards {
-    _prefill: PrefillLoadGuard,
     _decode: WorkerLoadGuard,
 }
 
@@ -624,7 +623,6 @@ impl PDRouter {
         let raw_body_len = header_utils::content_length(headers);
 
         let load_guards = PdLoadGuards {
-            _prefill: prefill_guard,
             _decode: decode_guard,
         };
 
@@ -690,6 +688,7 @@ impl PDRouter {
                     context,
                     Arc::clone(&prefill),
                     Arc::clone(&decode),
+                    prefill_guard,
                     load_guards,
                 )
                 .await;
@@ -786,6 +785,7 @@ impl PDRouter {
                 context,
                 Arc::clone(&prefill),
                 Arc::clone(&decode),
+                prefill_guard,
                 load_guards,
             )
             .await;
@@ -933,6 +933,7 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        prefill_guard: PrefillLoadGuard,
         load_guards: PdLoadGuards,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
@@ -1042,6 +1043,8 @@ impl PDRouter {
             Err(error_response) => return error_response,
         };
 
+        drop(prefill_guard);
+
         // Prefill RPC duration: prefill-head elapsed + body drain, independent
         // of decode so a slower decode head never inflates it.
         Metrics::record_pd_prefill_duration(
@@ -1114,6 +1117,7 @@ impl PDRouter {
         context: PDRequestContext<'_>,
         prefill: Arc<dyn Worker>,
         decode: Arc<dyn Worker>,
+        prefill_guard: PrefillLoadGuard,
         load_guards: PdLoadGuards,
     ) -> Response {
         let (prefill_body, decode_body) = leg_bodies;
@@ -1219,6 +1223,7 @@ impl PDRouter {
             );
             None
         };
+        drop(prefill_guard);
         let decode_params = match (&mode, harvested) {
             // Modern Mooncake: synthesized params under the minted transfer_id
             (
@@ -2977,9 +2982,6 @@ mod tests {
         };
 
         let load_guards = PdLoadGuards {
-            _prefill: PrefillLoadGuard::Unbounded {
-                _guard: WorkerLoadGuard::new(prefill.clone(), None),
-            },
             _decode: WorkerLoadGuard::new(decode.clone(), None),
         };
 
@@ -3099,10 +3101,10 @@ mod tests {
         let stream = ReceiverStream::new(rx);
 
         {
+            let prefill_guard = PrefillLoadGuard::Unbounded {
+                _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
+            };
             let guards = PdLoadGuards {
-                _prefill: PrefillLoadGuard::Unbounded {
-                    _guard: WorkerLoadGuard::new(prefill_ref.clone(), None),
-                },
                 _decode: WorkerLoadGuard::new(decode_ref.clone(), None),
             };
 
@@ -3119,16 +3121,18 @@ mod tests {
                 guards,
             );
 
-            // Guards are now attached to response body, so load should be 1
-            assert_eq!(prefill_ref.load(), 1);
+            drop(prefill_guard);
+
+            // Decode guard is attached to the response body; Prefill can release first.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             tx.send(Bytes::from("test data")).await.unwrap();
 
             sleep(Duration::from_millis(10)).await;
 
-            // Load still 1 while response body exists
-            assert_eq!(prefill_ref.load(), 1);
+            // Decode load remains held while response body exists.
+            assert_eq!(prefill_ref.load(), 0);
             assert_eq!(decode_ref.load(), 1);
 
             drop(tx);

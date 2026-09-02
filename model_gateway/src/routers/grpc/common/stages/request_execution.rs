@@ -32,7 +32,7 @@ use crate::{
             utils::tonic_ext::{TonicResultExt, TonicStatusExt},
         },
     },
-    worker::ConnectionModeExt,
+    worker::{ConnectionModeExt, PrefillLoadGuard},
 };
 
 type StreamResult = Result<ProtoStream, tonic::Status>;
@@ -59,6 +59,48 @@ pub(crate) struct RequestExecutionStage;
 impl RequestExecutionStage {
     pub fn new() -> Self {
         Self
+    }
+
+    fn take_prefill_guard(
+        guard: &mut Option<PrefillLoadGuard>,
+    ) -> Result<PrefillLoadGuard, Response> {
+        guard.take().ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "Prefill admission reservation missing after PD worker selection"
+            );
+            error::internal_error(
+                "prefill_admission_missing",
+                "Prefill admission reservation missing after PD worker selection",
+            )
+        })
+    }
+
+    fn require_prefill_guard(
+        guard: Option<PrefillLoadGuard>,
+    ) -> Result<PrefillLoadGuard, Response> {
+        guard.ok_or_else(|| {
+            error!(
+                function = "RequestExecutionStage::execute",
+                "PD execution plan missing Prefill admission reservation"
+            );
+            error::internal_error(
+                "prefill_admission_missing",
+                "PD execution plan missing Prefill admission reservation",
+            )
+        })
+    }
+
+    fn replicate_prefill_guard(guard: PrefillLoadGuard, count: usize) -> Vec<PrefillLoadGuard> {
+        if count == 0 {
+            return Vec::new();
+        }
+        let mut guards = Vec::with_capacity(count);
+        for _ in 1..count {
+            guards.push(guard.replicate());
+        }
+        guards.push(guard);
+        guards
     }
 }
 
@@ -106,25 +148,18 @@ impl PipelineStage for RequestExecutionStage {
             ExecutionPlan::Batch { requests, .. } => requests.len(),
             _ => 1,
         };
-        ctx.state.load_guards = Some(match workers {
-            WorkerSelection::Disaggregated { decode, .. } => {
-                let prefill_guard = ctx.state.pd_prefill_guard.take().ok_or_else(|| {
-                    error!(
-                        function = "RequestExecutionStage::execute",
-                        "Prefill admission reservation missing after PD worker selection"
-                    );
-                    error::internal_error(
-                        "prefill_admission_missing",
-                        "Prefill admission reservation missing after PD worker selection",
-                    )
-                })?;
-                LoadGuards::disaggregated(
-                    prefill_guard,
-                    Arc::clone(decode),
-                    ctx.state.sticky_key.as_deref(),
-                    sub_requests,
-                )
+        let pd_prefill_guard = match workers {
+            WorkerSelection::Disaggregated { .. } => {
+                Some(Self::take_prefill_guard(&mut ctx.state.pd_prefill_guard)?)
             }
+            WorkerSelection::Single { .. } => None,
+        };
+        ctx.state.load_guards = Some(match workers {
+            WorkerSelection::Disaggregated { decode, .. } => LoadGuards::disaggregated(
+                Arc::clone(decode),
+                ctx.state.sticky_key.as_deref(),
+                sub_requests,
+            ),
             WorkerSelection::Single { .. } => {
                 LoadGuards::scaled(workers, ctx.state.sticky_key.as_deref(), sub_requests)
             }
@@ -156,18 +191,35 @@ impl PipelineStage for RequestExecutionStage {
                     }
                 },
                 ExecutionPlan::PrefillDecode(req) => {
-                    self.execute_pd_dispatch(req, clients, workers, model).await
+                    let prefill_guard = Self::require_prefill_guard(pd_prefill_guard)?;
+                    self.execute_pd_dispatch(req, clients, workers, model, prefill_guard)
+                        .await
                 }
                 ExecutionPlan::EncodePrefillDecode { request } => {
                     // Bootstrap info was injected into the prefill request during
                     // request building; dispatch the encode jobs with the
                     // prefill+decode leg.
-                    self.execute_epd_dispatch(request, clients, workers, model, encode_dispatch)
-                        .await
+                    let prefill_guard = Self::require_prefill_guard(pd_prefill_guard)?;
+                    self.execute_epd_dispatch(
+                        request,
+                        clients,
+                        workers,
+                        model,
+                        encode_dispatch,
+                        prefill_guard,
+                    )
+                    .await
                 }
                 ExecutionPlan::Batch { kind, requests, .. } => {
-                    self.execute_batch_dispatch(kind, requests, clients, workers, model)
-                        .await
+                    self.execute_batch_dispatch(
+                        kind,
+                        requests,
+                        clients,
+                        workers,
+                        model,
+                        pd_prefill_guard,
+                    )
+                    .await
                 }
             }
         }
@@ -191,6 +243,7 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
+        prefill_guard: PrefillLoadGuard,
     ) -> Result<ExecutionResult, Response> {
         let Some(runtime_type) = workers.disaggregated_runtime_type() else {
             error!(
@@ -219,11 +272,11 @@ impl RequestExecutionStage {
         // carried in the request.
         match protocol.dispatch {
             PdDispatch::Sequential => {
-                self.execute_sequential_pd(proto_request, clients, workers, model)
+                self.execute_sequential_pd(proto_request, clients, workers, model, prefill_guard)
                     .await
             }
             PdDispatch::Parallel => {
-                self.execute_parallel_pd(proto_request, clients, workers, protocol)
+                self.execute_parallel_pd(proto_request, clients, workers, protocol, prefill_guard)
                     .await
             }
         }
@@ -236,12 +289,13 @@ impl RequestExecutionStage {
         workers: &WorkerSelection,
         model: &str,
         encode_dispatch: Option<EncodeDispatchPlan>,
+        prefill_guard: PrefillLoadGuard,
     ) -> Result<ExecutionResult, Response> {
         if let Some(encode_dispatch) = encode_dispatch {
             Self::spawn_encode_dispatch(encode_dispatch);
         }
         proto_request.clear_mm_pixel_values();
-        self.execute_pd_dispatch(proto_request, clients, workers, model)
+        self.execute_pd_dispatch(proto_request, clients, workers, model, prefill_guard)
             .await
     }
 
@@ -299,22 +353,56 @@ impl RequestExecutionStage {
         clients: &ClientSelection,
         workers: &WorkerSelection,
         model: &str,
+        prefill_guard: Option<PrefillLoadGuard>,
     ) -> Result<ExecutionResult, Response> {
-        let dispatches = requests.into_iter().map(|request| {
+        let mut prefill_guards = match kind {
+            ExecutionPlanKind::Single => Vec::new(),
+            ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+                Self::replicate_prefill_guard(
+                    Self::require_prefill_guard(prefill_guard)?,
+                    requests.len(),
+                )
+            }
+        };
+        let mut dispatches = Vec::with_capacity(requests.len());
+        for request in requests {
             let mut clients = clients.clone();
-            async move {
+            let prefill_guard = match kind {
+                ExecutionPlanKind::Single => None,
+                ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
+                    Some(prefill_guards.pop().ok_or_else(|| {
+                        error::internal_error(
+                            "prefill_admission_missing",
+                            "Batched PD execution missing Prefill admission reservation",
+                        )
+                    })?)
+                }
+            };
+            dispatches.push(async move {
                 match kind {
                     ExecutionPlanKind::Single => {
                         self.execute_single(request, &mut clients, workers).await
                     }
                     // Completion EPD carries no encode jobs; sub-requests dispatch as PD.
                     ExecutionPlanKind::PrefillDecode | ExecutionPlanKind::EncodePrefillDecode => {
-                        self.execute_pd_dispatch(request, &mut clients, workers, model)
-                            .await
+                        let prefill_guard = prefill_guard.ok_or_else(|| {
+                            error::internal_error(
+                                "prefill_admission_missing",
+                                "Batched PD execution missing Prefill admission reservation",
+                            )
+                        })?;
+                        self.execute_pd_dispatch(
+                            request,
+                            &mut clients,
+                            workers,
+                            model,
+                            prefill_guard,
+                        )
+                        .await
                     }
                 }
-            }
-        });
+            });
+        }
 
         let results = try_join_all(dispatches).await?;
         Ok(ExecutionResult::Batch { results })
@@ -392,6 +480,7 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         protocol: PdProtocol,
+        prefill_guard: PrefillLoadGuard,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -487,6 +576,7 @@ impl RequestExecutionStage {
         Ok(ExecutionResult::PrefillDecode {
             prefill: prefill_stream,
             decode: Box::new(decode_stream),
+            prefill_guard: Some(prefill_guard),
             pd_timing: PdTiming {
                 prefill_start,
                 runtime,
@@ -506,6 +596,7 @@ impl RequestExecutionStage {
         clients: &mut ClientSelection,
         workers: &WorkerSelection,
         model: &str,
+        prefill_guard: PrefillLoadGuard,
     ) -> Result<ExecutionResult, Response> {
         let runtime = workers
             .disaggregated_runtime_type()
@@ -650,6 +741,7 @@ impl RequestExecutionStage {
             }
         }
         prefill_stream.mark_completed();
+        drop(prefill_guard);
         workers.record_outcome_prefill(200);
         // Captured at drain; recorded below only once decode is established.
         let prefill_duration = prefill_start.elapsed();

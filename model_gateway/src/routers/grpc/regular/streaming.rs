@@ -46,6 +46,7 @@ use crate::{
             utils::message_utils,
         },
     },
+    worker::PrefillLoadGuard,
 };
 
 /// One backend stream of a `/v1/completions` request. Batched requests fan
@@ -55,6 +56,7 @@ enum CompletionStreamUnit {
     PrefillDecode {
         prefill: ProtoStream,
         decode: Box<ProtoStream>,
+        prefill_guard: Option<PrefillLoadGuard>,
     },
 }
 
@@ -175,6 +177,7 @@ impl StreamingProcessor {
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
+                prefill_guard,
                 pd_timing,
             } => {
                 let processor = self.clone();
@@ -194,6 +197,7 @@ impl StreamingProcessor {
                             chat_request,
                             &tx,
                             pd_timing,
+                            prefill_guard,
                             reservation,
                         )
                         .await;
@@ -788,23 +792,19 @@ impl StreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        prefill_guard: Option<PrefillLoadGuard>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
-        // Phase 1.5: Collect input_logprobs from prefill stream if requested
-        if original_request.logprobs {
-            while let Some(response) = prefill_stream.next().await {
-                let gen_response =
-                    response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-                match gen_response.into_response() {
-                    ProtoResponseVariant::Complete(_complete) => {
-                        // Input logprobs collected but not yet used in streaming
-                        // (OpenAI spec doesn't require prompt logprobs in streaming responses)
-                        break;
-                    }
-                    _ => continue,
-                }
+        // Phase 1.5: Drain prefill stream. Streaming chat does not emit prompt
+        // logprobs, but the Prefill reservation must end with this phase.
+        while let Some(response) = prefill_stream.next().await {
+            let gen_response =
+                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            if let ProtoResponseVariant::Complete(_) = gen_response.into_response() {
+                break;
             }
         }
+        drop(prefill_guard);
 
         // Phase 2-5: Process decode stream (same as single mode). Pass pd_timing
         // so the first decode token yields honest PD TTFT.
@@ -889,6 +889,7 @@ impl StreamingProcessor {
             context::ExecutionResult::PrefillDecode {
                 prefill,
                 decode,
+                prefill_guard,
                 pd_timing,
             } => {
                 // For PD mode, need to handle prefill stream for input_logprobs
@@ -905,6 +906,7 @@ impl StreamingProcessor {
                         ctx,
                         &tx,
                         pd_timing,
+                        prefill_guard,
                         reservation,
                     )
                     .await;
@@ -1087,30 +1089,25 @@ impl StreamingProcessor {
         ctx: GenerateStreamContext,
         tx: &SseSender,
         pd_timing: context::PdTiming,
+        prefill_guard: Option<PrefillLoadGuard>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
-        // Collect input_logprobs from prefill stream if requested
-        let input_token_logprobs = if ctx.return_logprob {
-            let mut input_logprobs = None;
-            while let Some(response) = prefill_stream.next().await {
-                let gen_response =
-                    response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
-                match gen_response.into_response() {
-                    ProtoResponseVariant::Complete(complete) => {
-                        // Extract input_logprobs from prefill Complete message (convert proto to SGLang format)
-                        input_logprobs = complete
-                            .input_logprobs()
-                            .as_ref()
-                            .map(utils::convert_generate_input_logprobs);
-                        break;
-                    }
-                    _ => continue,
+        // Drain prefill stream. Collect input_logprobs only when requested.
+        let mut input_token_logprobs = None;
+        while let Some(response) = prefill_stream.next().await {
+            let gen_response =
+                response.map_err(|e| format!("Prefill stream error: {}", e.message()))?;
+            if let ProtoResponseVariant::Complete(complete) = gen_response.into_response() {
+                if ctx.return_logprob {
+                    input_token_logprobs = complete
+                        .input_logprobs()
+                        .as_ref()
+                        .map(utils::convert_generate_input_logprobs);
                 }
+                break;
             }
-            input_logprobs
-        } else {
-            None
-        };
+        }
+        drop(prefill_guard);
 
         // Process decode stream with input_logprobs prepended. Pass pd_timing so
         // the first decode token yields honest PD TTFT.
@@ -1796,6 +1793,7 @@ impl StreamingProcessor {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
+                prefill_guard,
                 ..
             } => {
                 let processor = self.clone();
@@ -1814,6 +1812,7 @@ impl StreamingProcessor {
                             stop_params,
                             messages_request,
                             &tx,
+                            prefill_guard,
                             reservation,
                         )
                         .await;
@@ -2585,6 +2584,7 @@ impl StreamingProcessor {
         stop_params: (Option<StringOrArray>, Option<Vec<u32>>, bool, bool, bool),
         original_request: Arc<CreateMessageRequest>,
         tx: &SseSender,
+        prefill_guard: Option<PrefillLoadGuard>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Consume prefill stream (Messages API does not expose prompt logprobs)
@@ -2596,6 +2596,7 @@ impl StreamingProcessor {
                 _ => continue,
             }
         }
+        drop(prefill_guard);
 
         let result = self
             .process_messages_streaming_chunks(
@@ -2702,7 +2703,11 @@ impl StreamingProcessor {
                                     )
                                     .await
                             }
-                            CompletionStreamUnit::PrefillDecode { prefill, decode } => {
+                            CompletionStreamUnit::PrefillDecode {
+                                prefill,
+                                decode,
+                                prefill_guard,
+                            } => {
                                 processor
                                     .process_prefill_decode_completion_streaming_chunks(
                                         prefill,
@@ -2714,6 +2719,7 @@ impl StreamingProcessor {
                                         prompt_text,
                                         index_offset,
                                         tx,
+                                        prefill_guard,
                                     )
                                     .await
                             }
@@ -2814,10 +2820,12 @@ impl StreamingProcessor {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
+                prefill_guard,
                 ..
             } => Ok(vec![CompletionStreamUnit::PrefillDecode {
                 prefill,
                 decode,
+                prefill_guard,
             }]),
             context::ExecutionResult::Batch { results } => results
                 .into_iter()
@@ -2826,8 +2834,15 @@ impl StreamingProcessor {
                         Ok(CompletionStreamUnit::Single(stream))
                     }
                     context::ExecutionResult::PrefillDecode {
-                        prefill, decode, ..
-                    } => Ok(CompletionStreamUnit::PrefillDecode { prefill, decode }),
+                        prefill,
+                        decode,
+                        prefill_guard,
+                        ..
+                    } => Ok(CompletionStreamUnit::PrefillDecode {
+                        prefill,
+                        decode,
+                        prefill_guard,
+                    }),
                     _ => Err("Nested batch or embedding result in completion streaming"),
                 })
                 .collect(),
@@ -3169,6 +3184,7 @@ impl StreamingProcessor {
         prompt_text: &str,
         index_offset: u32,
         tx: &SseSender,
+        prefill_guard: Option<PrefillLoadGuard>,
     ) -> Result<CompletionStreamOutcome, String> {
         while let Some(response) = prefill_stream.next().await {
             let gen_response =
@@ -3179,6 +3195,7 @@ impl StreamingProcessor {
                 _ => continue,
             }
         }
+        drop(prefill_guard);
 
         let result = self
             .process_completion_streaming_chunks(

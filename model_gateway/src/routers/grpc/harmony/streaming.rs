@@ -51,6 +51,7 @@ use crate::{
             utils,
         },
     },
+    worker::PrefillLoadGuard,
 };
 
 /// Whether a tool call of this `ResponseFormat` streams its arguments via
@@ -135,6 +136,7 @@ impl HarmonyStreamingProcessor {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
+                prefill_guard,
                 ..
             } => {
                 tokio::spawn(async move {
@@ -145,6 +147,7 @@ impl HarmonyStreamingProcessor {
                         chat_request,
                         &tx,
                         router_stop_strings,
+                        prefill_guard,
                         reservation,
                     )
                     .await;
@@ -216,6 +219,7 @@ impl HarmonyStreamingProcessor {
         original_request: Arc<ChatCompletionRequest>,
         tx: &SseSender,
         router_stop_strings: Vec<String>,
+        prefill_guard: Option<PrefillLoadGuard>,
         reservation: Option<Arc<SharedReservationHandle>>,
     ) -> Result<(), String> {
         // Phase 1: Process prefill stream (collect metadata)
@@ -230,6 +234,7 @@ impl HarmonyStreamingProcessor {
                 cached_tokens.insert(complete_wrapper.index(), complete_wrapper.cached_tokens());
             }
         }
+        drop(prefill_guard);
 
         // Phase 2: Decode (shared helper)
         Self::process_chat_decode_stream(
@@ -701,6 +706,7 @@ impl HarmonyStreamingProcessor {
                 // TODO(#1781 follow-up): thread pd_timing for honest PD TTFT
                 prefill,
                 decode,
+                prefill_guard,
                 ..
             } => {
                 debug!("Processing Responses API prefill/decode stream mode");
@@ -711,6 +717,7 @@ impl HarmonyStreamingProcessor {
                     tx,
                     session,
                     format_registry,
+                    prefill_guard,
                 )
                 .await
             }
@@ -731,6 +738,7 @@ impl HarmonyStreamingProcessor {
         tx: &SseSender,
         session: Option<&McpToolSession<'_>>,
         format_registry: Option<&FormatRegistry>,
+        prefill_guard: Option<PrefillLoadGuard>,
     ) -> Result<ResponsesIterationResult, String> {
         // Phase 1: Drain prefill stream, collecting cached_tokens from Complete messages
         let mut prefill_cached_tokens_by_index: HashMap<u32, u32> = HashMap::new();
@@ -742,6 +750,7 @@ impl HarmonyStreamingProcessor {
             }
         }
         let prefill_cached_tokens: u32 = prefill_cached_tokens_by_index.values().sum();
+        drop(prefill_guard);
 
         // Phase 2: Process decode stream
         let result = Self::process_decode_stream(
