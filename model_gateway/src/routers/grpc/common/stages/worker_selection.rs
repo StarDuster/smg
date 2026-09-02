@@ -17,7 +17,7 @@ use crate::{
         WorkerLeg,
     },
     routers::{
-        common::overload,
+        common::{header_utils, overload},
         error,
         grpc::{
             context::{EncodeWorkerAssignment, RequestContext, WorkerSelection},
@@ -554,10 +554,16 @@ impl WorkerSelectionStage {
             return Err(GrpcPdCandidateError::Unavailable);
         }
 
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let targeted = prefill_policy.name() == "consistent_hashing"
+            && header_utils::extract_target_worker(headers).is_some();
+
         if let Some(capacity) = capacity {
             let had_available = !available_prefill.is_empty();
-            available_prefill.retain(|worker| capacity.has_capacity(worker));
-            if available_prefill.is_empty() {
+            if !targeted {
+                available_prefill.retain(|worker| capacity.has_capacity(worker));
+            }
+            if !targeted && available_prefill.is_empty() {
                 return Err(if had_available {
                     GrpcPdCandidateError::AtCapacity
                 } else {
@@ -567,7 +573,6 @@ impl WorkerSelectionStage {
         }
 
         // Independent P/D policies so stateful ones (e.g. round_robin) don't share a counter.
-        let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
@@ -588,6 +593,10 @@ impl WorkerSelectionStage {
             .policy_registry
             .select_worker(&prefill_policy, &available_prefill, &info)
             .ok_or(GrpcPdCandidateError::Unavailable)?;
+        let prefill = available_prefill[prefill_idx].clone();
+        if capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
+            return Err(GrpcPdCandidateError::AtCapacity);
+        }
         info.leg = WorkerLeg::Decode;
         let decode_idx = self
             .policy_registry
@@ -599,9 +608,7 @@ impl WorkerSelectionStage {
         // Record worker selection metrics for both prefill and decode
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
-            available_prefill[prefill_idx]
-                .connection_mode()
-                .as_metric_label(),
+            prefill.connection_mode().as_metric_label(),
             model,
             prefill_policy.name(),
         );
@@ -615,7 +622,7 @@ impl WorkerSelectionStage {
         );
 
         Ok((
-            available_prefill[prefill_idx].clone(),
+            prefill,
             available_decode[decode_idx].clone(),
             target_runtime,
         ))
@@ -747,10 +754,16 @@ impl WorkerSelectionStage {
             return Err(GrpcPdCandidateError::Unavailable);
         }
 
+        let prefill_policy = self.policy_registry.get_prefill_policy();
+        let targeted = prefill_policy.name() == "consistent_hashing"
+            && header_utils::extract_target_worker(headers).is_some();
+
         if let Some(capacity) = capacity {
             let had_available = !available_prefill.is_empty();
-            available_prefill.retain(|worker| capacity.has_capacity(worker));
-            if available_prefill.is_empty() {
+            if !targeted {
+                available_prefill.retain(|worker| capacity.has_capacity(worker));
+            }
+            if !targeted && available_prefill.is_empty() {
                 return Err(if had_available {
                     GrpcPdCandidateError::AtCapacity
                 } else {
@@ -763,7 +776,6 @@ impl WorkerSelectionStage {
         // defaults to consistent hashing over each item's content hash; prefill
         // and decode fall back to the main policy when unset.
         let encode_policy = self.policy_registry.get_encode_policy();
-        let prefill_policy = self.policy_registry.get_prefill_policy();
         let decode_policy = self.policy_registry.get_decode_policy();
 
         // Get cached hash ring for consistent hashing (O(log n) lookup)
@@ -782,6 +794,10 @@ impl WorkerSelectionStage {
             .policy_registry
             .select_worker(&prefill_policy, &available_prefill, &info)
             .ok_or(GrpcPdCandidateError::Unavailable)?;
+        let prefill = available_prefill[prefill_idx].clone();
+        if capacity.is_some_and(|capacity| !capacity.has_capacity(&prefill)) {
+            return Err(GrpcPdCandidateError::AtCapacity);
+        }
         info.leg = WorkerLeg::Decode;
         let decode_idx = self
             .policy_registry
@@ -802,9 +818,7 @@ impl WorkerSelectionStage {
         // recorded in assign_encode_workers.
         Metrics::record_worker_selection(
             metrics_labels::WORKER_PREFILL,
-            available_prefill[prefill_idx]
-                .connection_mode()
-                .as_metric_label(),
+            prefill.connection_mode().as_metric_label(),
             model_id,
             prefill_policy.name(),
         );
@@ -819,7 +833,7 @@ impl WorkerSelectionStage {
 
         Ok((
             encode_assignments,
-            available_prefill[prefill_idx].clone(),
+            prefill,
             available_decode[decode_idx].clone(),
             target_runtime,
         ))
