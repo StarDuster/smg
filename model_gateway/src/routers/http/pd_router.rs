@@ -2959,7 +2959,7 @@ mod tests {
     async fn test_streaming_decode_error_emits_valid_json_sse() {
         let router = create_test_pd_router();
 
-        let prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
+        let _prefill: Arc<dyn Worker> = Arc::from(create_test_worker(
             "http://prefill".to_string(),
             WorkerType::Prefill,
             true,

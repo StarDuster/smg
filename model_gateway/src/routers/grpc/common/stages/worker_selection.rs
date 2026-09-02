@@ -646,6 +646,10 @@ impl WorkerSelectionStage {
     /// are filtered to a runtime shared by the selected encode/prefill/decode
     /// legs.
     #[cfg(test)]
+    #[expect(
+        dead_code,
+        reason = "EPD selection helper is retained for routing-policy regression tests"
+    )]
     fn select_encode_prefill_decode_workers(
         &self,
         model_id: &str,

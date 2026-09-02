@@ -21,6 +21,8 @@ use tokio_stream::wrappers::ReceiverStream;
 use tracing::warn;
 use uuid::Uuid;
 
+#[cfg(test)]
+use crate::routers::common::sse::sse_channel;
 use crate::routers::{
     common::{
         openai_bridge::{self, descriptor, ResponseFormat},
@@ -1080,7 +1082,7 @@ mod tests {
     #[tokio::test]
     async fn await_stream_startup_returns_backend_error_response() {
         let (startup_tx, startup_rx) = stream_startup_channel();
-        let (_sse_tx, sse_rx) = crate::routers::common::sse::sse_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
         let response = Response::builder()
             .status(StatusCode::SERVICE_UNAVAILABLE)
             .body(Body::empty())
@@ -1095,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn signal_stream_startup_returns_sse_after_success() {
         let (startup_tx, startup_rx) = stream_startup_channel();
-        let (_sse_tx, sse_rx) = crate::routers::common::sse::sse_channel();
+        let (_sse_tx, sse_rx) = sse_channel();
         let mut startup = Some(startup_tx);
 
         assert!(signal_stream_startup(&mut startup, Ok(())));
