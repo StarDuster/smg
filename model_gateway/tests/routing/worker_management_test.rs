@@ -17,6 +17,7 @@ use tower::ServiceExt;
 
 use crate::common::{AppTestContext, TestRouterConfig, TestWorkerConfig};
 
+#[cfg(test)]
 mod dp_removal_tests {
     use std::{sync::Arc, time::Duration};
 
