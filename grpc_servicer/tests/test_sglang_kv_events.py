@@ -191,3 +191,189 @@ async def test_bad_payload_does_not_hide_native_sequence_gap(bridge):
     await bridge.publish(12)
     assert (await read(call)).sequence_number == 12
     call.cancel()
+
+
+@pytest_asyncio.fixture
+async def replay(bridge):
+    socket = bridge.ctx.socket(zmq.ROUTER)
+    port = socket.bind_to_random_port("tcp://127.0.0.1")
+    bridge.config.replay_endpoint = f"tcp://127.0.0.1:{port}"
+
+    async def request(cursor):
+        frames = await asyncio.wait_for(socket.recv_multipart(), 3)
+        assert frames[1:] == [b"", (cursor + 1).to_bytes(8, "big")]
+        return frames[0]
+
+    async def send(identity, seq, payload=None):
+        wire_seq = transport._END_SEQ if seq == -1 else seq.to_bytes(8, "big")
+        await socket.send_multipart(
+            [identity, b"", wire_seq, str(seq).encode() if payload is None else payload]
+        )
+
+    try:
+        yield SimpleNamespace(request=request, send=send, socket=socket)
+    finally:
+        socket.close(linger=0)
+
+
+@pytest.mark.asyncio
+async def test_replay_handoff_keeps_order_and_deduplicates_live_overlap(bridge, replay):
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await bridge.subscribed()
+    # Queue both overlap and new live traffic while historical replay runs.
+    for seq in (101, 102, 103):
+        await bridge.publish(seq)
+    for seq in (101, 102):
+        await replay.send(identity, seq)
+        batch = await read(call)
+        assert (batch.sequence_number, batch.timestamp) == (seq, seq)
+    await replay.send(identity, -1)
+    assert (await read(call)).sequence_number == 103
+    await bridge.publish(104)
+    assert (await read(call)).sequence_number == 104
+    assert bridge.cursors == [100]
+    call.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first", [-1, 90, 103])
+async def test_empty_or_expired_history_requires_fresh_subscription(bridge, replay, first):
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await replay.send(identity, first)
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await read(call)
+    assert error.value.code() == grpc.StatusCode.OUT_OF_RANGE
+    fresh = bridge.subscribe()
+    await bridge.subscribed()
+    # The failed call also subscribed; drain its subscribe/unsubscribe so the
+    # new live subscriber is established before sending.
+    await bridge.subscribed()
+    await bridge.publish(120)
+    assert (await read(fresh)).sequence_number == 120
+    fresh.cancel()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["gap", "decode", "timeout", "malformed"])
+async def test_partial_replay_failure_signals_data_loss(bridge, replay, monkeypatch, fault):
+    monkeypatch.setattr(transport, "_REPLAY_TIMEOUT_MS", 100)
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await replay.send(identity, 101)
+    assert (await read(call)).sequence_number == 101
+    if fault == "gap":
+        await replay.send(identity, 103)
+    elif fault == "decode":
+        await replay.send(identity, 102, b"bad")
+    elif fault == "malformed":
+        await replay.socket.send_multipart([identity, b"", b"bad", b""])
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await read(call)
+    assert error.value.code() == grpc.StatusCode.DATA_LOSS
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("fault", ["timeout", "malformed", "decode"])
+async def test_replay_failure_before_headers_signals_out_of_range(
+    bridge, replay, monkeypatch, fault
+):
+    monkeypatch.setattr(transport, "_REPLAY_TIMEOUT_MS", 100)
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    if fault == "malformed":
+        await replay.socket.send_multipart([identity, b"", b"bad", b""])
+    elif fault == "decode":
+        await replay.send(identity, 101, b"bad")
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await read(call)
+    assert error.value.code() == grpc.StatusCode.OUT_OF_RANGE
+
+
+@pytest.mark.asyncio
+async def test_zero_cursor_does_not_replay_old_history(bridge, replay):
+    call = bridge.subscribe()
+    await bridge.subscribed()
+    await bridge.publish(7)
+    assert (await read(call)).sequence_number == 7
+    assert not await replay.socket.poll(timeout=50)
+    call.cancel()
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_replay_releases_live_subscription(bridge, replay):
+    call = bridge.subscribe(100)
+    await replay.request(100)
+    await bridge.subscribed()
+    call.cancel()
+    assert await asyncio.wait_for(bridge.pub.recv(), 3) == b"\x00kv"
+
+
+@pytest.mark.asyncio
+async def test_live_gap_after_replay_remains_visible_for_next_recovery(bridge, replay):
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await bridge.subscribed()
+    await replay.send(identity, 101)
+    await replay.send(identity, -1)
+    assert (await read(call)).sequence_number == 101
+    await bridge.publish(103)
+    assert (await read(call)).sequence_number == 103
+    call.cancel()
+
+
+@pytest.mark.asyncio
+async def test_invalid_replay_endpoint_falls_back_without_retaining_cursor(bridge):
+    bridge.config.replay_endpoint = "invalid://endpoint"
+    call = bridge.subscribe(100)
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await read(call)
+    assert error.value.code() == grpc.StatusCode.OUT_OF_RANGE
+
+
+@pytest.mark.asyncio
+async def test_decode_failure_closes_both_sockets(bridge, replay, monkeypatch):
+    ctx = zmq.asyncio.Context.instance()
+    sockets = []
+
+    def socket(kind):
+        result = ctx.socket(kind)
+        sockets.append(result)
+        return result
+
+    monkeypatch.setattr(zmq.asyncio.Context, "instance", lambda: SimpleNamespace(socket=socket))
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await replay.send(identity, 101, b"bad")
+    with pytest.raises(grpc.aio.AioRpcError) as error:
+        await read(call)
+    assert error.value.code() == grpc.StatusCode.OUT_OF_RANGE
+    assert len(sockets) == 2
+    assert all(socket.closed for socket in sockets)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("hwm", [None, 4096, 0])
+async def test_live_backlog_survives_replay_with_publisher_hwm(bridge, replay, monkeypatch, hwm):
+    if hwm is not None:
+        bridge.config.hwm = hwm
+    # In-process transport makes queue capacity deterministic, without TCP
+    # kernel buffers masking a too-small SUB HWM. Limit the sender's share.
+    bridge.pub.setsockopt(zmq.SNDHWM, 1)
+    bridge.config.endpoint = "inproc://kv-replay-backlog"
+    bridge.pub.bind(bridge.config.endpoint)
+    monkeypatch.setattr(zmq.asyncio.Context, "instance", lambda: bridge.ctx)
+
+    call = bridge.subscribe(100)
+    identity = await replay.request(100)
+    await bridge.subscribed()
+    await replay.send(identity, 101)
+    assert (await read(call)).sequence_number == 101
+    # Keep replay open while more than the default 1000 live batches queue.
+    for seq in range(102, 2150):
+        await bridge.publish(seq)
+    await replay.send(identity, -1)
+    for seq in range(102, 2150):
+        assert (await read(call)).sequence_number == seq
+    call.cancel()

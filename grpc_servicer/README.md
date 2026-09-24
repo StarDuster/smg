@@ -139,6 +139,27 @@ python -m smg_grpc_servicer.tokenspeed --model meta-llama/Llama-2-7b-hf --host 0
 sglang serve --model-path meta-llama/Llama-2-7b-hf --grpc-mode
 ```
 
+#### KV-event recovery
+
+To retain cache knowledge across a recoverable event gap, configure SGLang's
+`--kv-events-config` with both a PUB endpoint and a replay endpoint, for example:
+
+```json
+{"publisher":"zmq","endpoint":"tcp://*:5557","replay_endpoint":"tcp://*:5558","buffer_steps":10000}
+```
+
+The bridge subscribes to live events before requesting missed batches from the
+replay endpoint, preserves publisher sequence numbers, and removes overlap at
+handoff. Both subscriptions currently use DP rank 0; allocate non-overlapping
+port ranges if multiple DP ranks publish events.
+
+Without replay, or when history is expired, empty, malformed, or unavailable
+(timeout: five seconds), the bridge reports `OUT_OF_RANGE` before streaming or
+`DATA_LOSS` after streaming starts. SMG discards that worker's stale mappings and
+resubscribes with zero. A zero cursor rebuilds knowledge from subsequent live
+events; it is not a complete cache snapshot. An empty replay is conservatively
+reset because it cannot distinguish an idle publisher from a restarted one.
+
 ## Architecture
 
 ```
@@ -156,10 +177,3 @@ Backend dependencies are isolated via extras or runtime installs to avoid confli
 ## Development
 
 See [DEVELOPMENT.md](DEVELOPMENT.md) for local development setup, CI, and release workflows.
-
-### SGLang KV-event recovery
-
-The SGLang gRPC bridge currently streams live KV events. A nonzero resume
-cursor returns `OUT_OF_RANGE`, allowing SMG to discard that worker's stale
-cache mappings and subscribe again with a zero cursor. The fresh subscription
-rebuilds cache knowledge from subsequent events; it is not a full cache snapshot.
