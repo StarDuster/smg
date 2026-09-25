@@ -50,6 +50,8 @@ pub enum ThinkingKeyName {
     /// "enabled" prefills the think-start token, "disabled" prefills the
     /// think-end token, "adaptive"/absent adds no prefix.
     ThinkingMode,
+    /// Hy4 uses reasoning_effort=high/no_think.
+    HyV4Effort,
 }
 
 impl ThinkingKeyName {
@@ -59,6 +61,7 @@ impl ThinkingKeyName {
             ThinkingKeyName::EnableThinking => "enable_thinking",
             ThinkingKeyName::Thinking => "thinking",
             ThinkingKeyName::ThinkingMode => "thinking_mode",
+            ThinkingKeyName::HyV4Effort => "reasoning_effort",
         }
     }
 }
@@ -83,6 +86,12 @@ pub enum ThinkingToggle {
 /// Detect whether the chat template supports a thinking/reasoning toggle
 /// and what its default value is.
 pub fn detect_thinking_toggle(template: &str) -> (ThinkingToggle, Option<ThinkingKeyName>) {
+    if template.contains("think_begin_token")
+        && template.contains("no_think")
+        && template.contains("reasoning_effort")
+    {
+        return (ThinkingToggle::DefaultOn, Some(ThinkingKeyName::HyV4Effort));
+    }
     // Tri-state string toggle, detected only when the template actually
     // branches on the variable: only `thinking_mode == "enabled"` prefills
     // the think-start token, so the toggle defaults OFF.
@@ -1120,6 +1129,9 @@ impl ChatTemplateState {
                     ThinkingKeyName::EnableThinking | ThinkingKeyName::Thinking => {
                         serde_json::Value::Bool(thinking)
                     }
+                    ThinkingKeyName::HyV4Effort => serde_json::Value::String(
+                        if thinking { "high" } else { "no_think" }.to_string(),
+                    ),
                     // The tri-state key compares strings, not booleans.
                     ThinkingKeyName::ThinkingMode => serde_json::Value::String(
                         if thinking { "enabled" } else { "disabled" }.to_string(),
@@ -1384,5 +1396,52 @@ mod tests {
         let state = ChatTemplateState::new(Some("{{ undefined_value }}".to_string())).unwrap();
         let out = state.apply(&[], ChatTemplateParams::default()).unwrap();
         assert_eq!(out, "");
+    }
+}
+
+#[cfg(test)]
+mod hy_v4_tests {
+    use super::*;
+    #[test]
+    fn hy4_effort_controls_prefill_and_explicit_kwarg_wins() {
+        let template = "{% set think_begin_token = '<think:6124c78e>' %}{% if reasoning_effort is not defined %}{% set reasoning_effort = 'high' %}{% endif %}{{ think_begin_token }}{% if reasoning_effort == 'no_think' %}</think:6124c78e>{% endif %}";
+        let state = ChatTemplateState::new(Some(template.to_string())).unwrap();
+        assert_eq!(state.thinking_toggle(), ThinkingToggle::DefaultOn);
+        assert_eq!(state.thinking_key_name(), Some(ThinkingKeyName::HyV4Effort));
+        for (thinking, expected) in [
+            (None, "<think:6124c78e>"),
+            (Some(true), "<think:6124c78e>"),
+            (Some(false), "<think:6124c78e></think:6124c78e>"),
+        ] {
+            assert_eq!(
+                state
+                    .apply(
+                        &[],
+                        ChatTemplateParams {
+                            thinking,
+                            ..Default::default()
+                        }
+                    )
+                    .unwrap(),
+                expected
+            );
+        }
+        let kwargs = HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("no_think"),
+        )]);
+        assert_eq!(
+            state
+                .apply(
+                    &[],
+                    ChatTemplateParams {
+                        thinking: Some(true),
+                        template_kwargs: Some(&kwargs),
+                        ..Default::default()
+                    }
+                )
+                .unwrap(),
+            "<think:6124c78e></think:6124c78e>"
+        );
     }
 }

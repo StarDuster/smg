@@ -156,8 +156,14 @@ pub(crate) fn extract_thinking_from_kwargs(
                     .flatten()
             })
         }
-        // Tri-state string toggle: "adaptive" (or any other value) means the
-        // template adds no prefix, so it maps to no preference.
+        Some(ThinkingKeyName::HyV4Effort) => {
+            match kwargs.get("reasoning_effort").and_then(Value::as_str) {
+                Some("no_think") => Some(false),
+                Some("high") => Some(true),
+                _ => None,
+            }
+        }
+        // Tri-state string toggle: adaptive adds no reasoning prefix.
         Some(ThinkingKeyName::ThinkingMode) => {
             match kwargs.get("thinking_mode").and_then(Value::as_str) {
                 Some("enabled") => Some(true),
@@ -183,6 +189,17 @@ fn extract_template_effort_thinking(
     reasoning_effort: Option<&str>,
     tokenizer: &dyn Tokenizer,
 ) -> Option<bool> {
+    if tokenizer.thinking_key_name() == Some(ThinkingKeyName::HyV4Effort) {
+        return match kwargs
+            .and_then(|k| k.get("reasoning_effort"))
+            .and_then(Value::as_str)
+            .or(reasoning_effort)
+        {
+            Some("no_think") => Some(false),
+            Some("high") => Some(true),
+            _ => None,
+        };
+    }
     let native_values = tokenizer.native_reasoning_effort_values();
     if native_values.is_empty() {
         return None;
@@ -915,5 +932,33 @@ mod parser_resolver_tests {
             let resolver = ParserResolver::new(registry, None, None);
             assert_eq!(resolver.tool_parser("m").as_deref(), Some("alpha"));
         }
+    }
+}
+
+#[cfg(test)]
+mod hy_v4_tests {
+    use super::*;
+    #[test]
+    fn hy4_effort_arms_parser_like_template() {
+        let tok = llm_tokenizer::MockTokenizer::new()
+            .with_thinking_toggle(ThinkingToggle::DefaultOn)
+            .with_thinking_key_name(ThinkingKeyName::HyV4Effort);
+        assert!(should_mark_reasoning_started(None, &tok));
+        assert_eq!(
+            extract_template_effort_thinking(None, Some("no_think"), &tok),
+            Some(false)
+        );
+        let kwargs = std::collections::HashMap::from([(
+            "reasoning_effort".to_string(),
+            serde_json::json!("high"),
+        )]);
+        assert_eq!(
+            extract_thinking_from_kwargs(Some(&kwargs), &tok),
+            Some(true)
+        );
+        assert_eq!(
+            extract_template_effort_thinking(Some(&kwargs), Some("no_think"), &tok),
+            Some(true)
+        );
     }
 }
