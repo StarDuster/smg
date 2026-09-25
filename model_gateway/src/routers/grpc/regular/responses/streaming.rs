@@ -56,8 +56,12 @@ use crate::{
             common::responses::{
                 await_stream_startup, build_sse_response, persist_response_if_needed,
                 signal_stream_startup, stream_startup_channel,
-                streaming::{attach_mcp_server_label, OutputItemKind, ResponseStreamEventEmitter, StreamStartupSender},
-                utils::{function_call_status, generation_failure_error, resolve_function_identity},
+                streaming::{
+                    attach_mcp_server_label, ResponseStreamEventEmitter, StreamStartupSender,
+                },
+                utils::{
+                    function_call_status, generation_failure_error, resolve_function_identity,
+                },
                 ResponsesContext,
             },
             utils,

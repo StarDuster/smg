@@ -1009,7 +1009,9 @@ impl PDRouter {
                 });
                 // A Decode error or cancellation before both heads arrive
                 // cancels the drain too, releasing its admission permit.
-                return Ok(PrefillResult::Draining(tokio_util::task::AbortOnDropHandle::new(drain)));
+                return Ok(PrefillResult::Draining(
+                    tokio_util::task::AbortOnDropHandle::new(drain),
+                ));
             }
             let result = self
                 .process_prefill_response(resp, prefill.url(), context.return_logprob)

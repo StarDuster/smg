@@ -333,7 +333,9 @@ impl WorkerSelectionStage {
                     headers,
                     rid_key,
                     cache_namespace,
-                    candidate_filter: wire.filter(|w| w.requires_media_refs).map(|_| accepts_media_refs as fn(&dyn Worker) -> bool),
+                    candidate_filter: wire
+                        .filter(|w| w.requires_media_refs)
+                        .map(|_| accepts_media_refs as fn(&dyn Worker) -> bool),
                 };
                 let (pair, guard) = self
                     .admit_pd_pair(model_id, inputs, ctx.sticky_key.as_deref(), wire)
@@ -2176,6 +2178,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::Regular,
+            None,
         );
 
         for _ in 0..4 {
@@ -2231,6 +2234,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::Regular,
+            None,
         );
 
         assert!(stage
@@ -2288,6 +2292,7 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::Regular,
+            None,
         );
         for worker in &workers {
             worker_registry.set_worker_overloaded(worker, true);
@@ -2329,10 +2334,19 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
 
         let response = stage
-            .select_pd_pair(model_id, PlacementInputs { candidate_filter: Some(accepts_media_refs), ..Default::default() }, None, None)
+            .select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(accepts_media_refs),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
             .map_err(|failure| stage.pd_pair_failure(model_id, *failure, true))
             .expect_err("no prefill worker at all");
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
@@ -2379,10 +2393,19 @@ mod tests {
             Arc::clone(&worker_registry),
             Arc::clone(&policy_registry),
             WorkerSelectionMode::PrefillDecode,
+            None,
         );
 
         let response = stage
-            .select_pd_pair(model_id, PlacementInputs { candidate_filter: Some(accepts_media_refs), ..Default::default() }, None, None)
+            .select_pd_pair(
+                model_id,
+                PlacementInputs {
+                    candidate_filter: Some(accepts_media_refs),
+                    ..Default::default()
+                },
+                None,
+                None,
+            )
             .map_err(|failure| stage.pd_pair_failure(model_id, *failure, true))
             .expect_err("no advertising decode worker yet");
         assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
@@ -2401,8 +2424,16 @@ mod tests {
             .unwrap();
         for _ in 0..3 {
             let (prefill, decode, _) = stage
-                .select_pd_pair(model_id, PlacementInputs { candidate_filter: Some(accepts_media_refs), ..Default::default() }, None, None)
-            .map_err(|failure| stage.pd_pair_failure(model_id, *failure, true))
+                .select_pd_pair(
+                    model_id,
+                    PlacementInputs {
+                        candidate_filter: Some(accepts_media_refs),
+                        ..Default::default()
+                    },
+                    None,
+                    None,
+                )
+                .map_err(|failure| stage.pd_pair_failure(model_id, *failure, true))
                 .expect("advertising pair");
             assert_eq!(prefill.url(), "grpc://127.0.0.1:8721");
             assert_eq!(decode.url(), "grpc://127.0.0.1:8731");
