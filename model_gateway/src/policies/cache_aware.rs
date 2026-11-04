@@ -110,7 +110,9 @@ use super::{
 };
 use crate::{
     config::CacheIndexKind,
-    mesh::adapters::tree_sync::{RepairEntry, TreeDelta, TreeRepairPage, TreeSyncAdapter},
+    mesh::adapters::tree_sync::{
+        RepairEntry, TreePath, TreePathDelta, TreeRepairPage, TreeSyncAdapter,
+    },
     observability::{cache_trace, metrics::Metrics},
     worker::{
         liveness,
@@ -698,10 +700,10 @@ impl CacheAwarePolicy {
     /// adapter callback never runs under our read lock (avoids a future
     /// deadlock if the adapter path ever wants to write back into any
     /// policy state).
-    fn sync_local_insert(&self, model_id: &str, delta: TreeDelta) {
+    fn sync_local_insert(&self, model_id: &str, delta: TreePathDelta) {
         let adapter = self.mesh_tree_sync.read().as_ref().map(Arc::clone);
         if let Some(adapter) = adapter {
-            adapter.on_local_insert(model_id, delta);
+            adapter.on_local_path_insert(model_id, delta);
         }
     }
 
@@ -1127,9 +1129,34 @@ pub trait TreeHandle: Send + Sync + std::fmt::Debug {
     /// `insert_tokens` are themselves idempotent for the same
     /// `(path, tenant)` pair.
     fn apply_repair_page(&self, page: &TreeRepairPage) -> usize;
+
+    /// Insert a peer's path for `worker_url` into the local tree of
+    /// `model_id`, if there is one. Returns whether it was inserted.
+    fn apply_remote_path(&self, _model_id: &str, _path: &TreePath, _worker_url: &str) -> bool {
+        false
+    }
 }
 
 impl TreeHandle for CacheAwarePolicy {
+    fn apply_remote_path(&self, model_id: &str, path: &TreePath, worker_url: &str) -> bool {
+        let model_id = normalize_model_key(model_id);
+        match path {
+            TreePath::Text(text) => {
+                let Some(tree) = self.string_trees.get(model_id).map(|t| Arc::clone(&t)) else {
+                    return false;
+                };
+                tree.insert_text(text, worker_url);
+            }
+            TreePath::Tokens(tokens) => {
+                let Some(tree) = self.token_trees.get(model_id).map(|t| Arc::clone(&t)) else {
+                    return false;
+                };
+                tree.insert_tokens(tokens, worker_url);
+            }
+        }
+        true
+    }
+
     fn apply_known_remote_insert(
         &self,
         model_id: &str,
@@ -3442,20 +3469,11 @@ impl CacheAwarePolicy {
 
         let idx = selected_idx?;
         if self.should_populate_hash_index() {
-            let matched_prefix: Vec<u32> = keyed[..result.matched_token_count].to_vec();
-            let node_hash = kv_index::hash_token_path(keyed);
-            self.hash_index
-                .entry(model_id.to_string())
-                .or_default()
-                .token_tree
-                .insert(node_hash, matched_prefix);
             self.sync_local_insert(
                 model_id,
-                TreeDelta {
-                    tree_kind: TreeKind::Token,
-                    node_hash,
+                TreePathDelta {
+                    path: TreePath::Tokens(keyed.to_vec()),
                     worker_url: workers[idx].url().to_string(),
-                    epoch: 0,
                 },
             );
         }
@@ -3523,20 +3541,11 @@ impl CacheAwarePolicy {
 
         let idx = selected_idx?;
         if self.should_populate_hash_index() {
-            let matched_prefix: String = keyed.chars().take(result.matched_char_count).collect();
-            let path_hash = kv_index::hash_node_path(keyed);
-            self.hash_index
-                .entry(model_id.to_string())
-                .or_default()
-                .string_tree
-                .insert(path_hash, matched_prefix);
             self.sync_local_insert(
                 model_id,
-                TreeDelta {
-                    tree_kind: TreeKind::String,
-                    node_hash: path_hash,
+                TreePathDelta {
+                    path: TreePath::Text(keyed.to_string()),
                     worker_url: workers[idx].url().to_string(),
-                    epoch: 0,
                 },
             );
         }

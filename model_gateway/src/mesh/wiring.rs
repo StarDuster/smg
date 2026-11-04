@@ -16,8 +16,8 @@ use tracing::debug;
 
 use super::adapters::{
     tree_sync::{
-        PeerList, RepairEntry, TreeRepairPage, TreeSyncAdapter, REPAIR_PAGE_PREFIX,
-        REPAIR_REQUEST_PREFIX, TENANT_DELTA_PREFIX,
+        PeerList, RepairEntry, TreePath, TreeRepairPage, TreeSyncAdapter, REPAIR_PAGE_PREFIX,
+        REPAIR_REQUEST_PREFIX, TENANT_DELTA_PREFIX, TREE_PATH_PREFIX,
     },
     RateLimitSyncAdapter, WorkerSyncAdapter,
 };
@@ -31,6 +31,11 @@ use crate::{
 /// through the (much more expensive) `tree:req:`/`tree:page:` path. Sized to
 /// cover a few gossip rounds of steady-state routing traffic.
 const TD_BUFFER_BYTES: usize = 4 * 1024 * 1024;
+
+/// Buffer budget for the broadcast tree-path namespace (`tp:`). Each entry
+/// carries the request's path, so a few gossip rounds of long prompts need
+/// more room than the hashes of `td:`.
+const TP_BUFFER_BYTES: usize = 32 * 1024 * 1024;
 
 /// Buffer budget for the targeted repair-request namespace. Requests
 /// carry small per-session metadata (session id, requester + target
@@ -93,6 +98,13 @@ impl MeshAdapters {
                 routing: StreamRouting::Broadcast,
             },
         );
+        let tp_ns = mesh_kv.configure_stream_prefix(
+            TREE_PATH_PREFIX,
+            StreamConfig {
+                max_buffer_bytes: TP_BUFFER_BYTES,
+                routing: StreamRouting::Broadcast,
+            },
+        );
         let repair_req_ns = mesh_kv.configure_stream_prefix(
             REPAIR_REQUEST_PREFIX,
             StreamConfig {
@@ -120,6 +132,7 @@ impl MeshAdapters {
             Arc::new(PolicyRegistryTreeHandle::new(policy_registry.clone()));
         let tree = TreeSyncAdapter::new(
             td_ns,
+            tp_ns,
             repair_req_ns,
             repair_page_ns,
             tree_handle,
@@ -241,6 +254,18 @@ impl fmt::Debug for PolicyRegistryTreeHandle {
 }
 
 impl TreeHandle for PolicyRegistryTreeHandle {
+    fn apply_remote_path(&self, model_id: &str, path: &TreePath, worker_url: &str) -> bool {
+        // The first cache-aware policy with a tree for the model takes it,
+        // as the known-hash delta does.
+        let mut applied = false;
+        self.for_each_cache_aware(model_id, |policy| {
+            if !applied {
+                applied = policy.apply_remote_path(model_id, path, worker_url);
+            }
+        });
+        applied
+    }
+
     fn apply_known_remote_insert(
         &self,
         model_id: &str,

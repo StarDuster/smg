@@ -39,6 +39,9 @@ const PREFIX: &str = "td:";
 pub(crate) const REPAIR_REQUEST_PREFIX: &str = "tree:req:";
 pub(crate) const REPAIR_PAGE_PREFIX: &str = "tree:page:";
 pub(crate) const TENANT_DELTA_PREFIX: &str = PREFIX;
+/// Broadcast namespace for [`TreePathDelta`]s: an insert with the path
+/// itself, which a receiver applies without any lookup.
+pub(crate) const TREE_PATH_PREFIX: &str = "tp:";
 
 /// Duration a repair session may sit without progress before
 /// the periodic retry scan reissues it. Spec §15 default: 5 s.
@@ -122,6 +125,26 @@ pub struct TreeDelta {
     /// paired with an older producer just sees zeros instead of a
     /// deserialization mismatch.
     pub epoch: u64,
+}
+
+/// The path of a [`TreePathDelta`]: the request's text (string tree) or
+/// tokens (token tree), namespace marker included.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum TreePath {
+    Text(String),
+    Tokens(Vec<u32>),
+}
+
+/// One prefix-tree insert observed on a producing node, carrying the path
+/// it inserted. A [`TreeDelta`] names the path by its hash, which only a
+/// node that routed the same request can resolve, so every new turn of a
+/// conversation routed elsewhere cost a whole-tree repair (#4752); this one
+/// a receiver inserts as it stands. `model_id` lives in the stream key.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TreePathDelta {
+    pub path: TreePath,
+    /// Worker URL that cached the prefix.
+    pub worker_url: String,
 }
 
 /// Why a node is asking for repair. Carried on the wire so the
@@ -437,6 +460,13 @@ impl RepairProgress {
 /// resolution and a [`PeerList`] for repair-request targeting.
 pub struct TreeSyncAdapter {
     tenant_deltas: Arc<StreamNamespace>,
+    /// Broadcast namespace for `tp:` path deltas.
+    tree_paths: Arc<StreamNamespace>,
+    pending_paths: DashMap<String, Vec<TreePathDelta>>,
+    /// The (model_id, kind) trees this node has asked a peer for once, on
+    /// its first path delta: the cold-start copy of the peer's tree. Later
+    /// inserts arrive as path deltas.
+    cold_started: DashMap<(String, TreeKind), ()>,
     /// Targeted namespace for `tree:req:*` repair requests.
     /// The adapter both publishes (5c, when a local node hits an
     /// unknown hash) and subscribes (d-2b, when a peer asks us
@@ -463,6 +493,7 @@ pub struct TreeSyncAdapter {
     /// Keeps the drain registration alive; dropping it unregisters
     /// from the mesh. `OnceLock` guards against a second `start`.
     drain_handle: OnceLock<DrainHandle>,
+    path_drain_handle: OnceLock<DrainHandle>,
 }
 
 impl std::fmt::Debug for TreeSyncAdapter {
@@ -518,6 +549,7 @@ impl TreeSyncAdapter {
     /// of fanning entries into the wrong stream.
     pub fn new(
         tenant_deltas: Arc<StreamNamespace>,
+        tree_paths: Arc<StreamNamespace>,
         tree_repair_requests: Arc<StreamNamespace>,
         tree_repair_pages: Arc<StreamNamespace>,
         tree: Arc<dyn TreeHandle>,
@@ -528,6 +560,11 @@ impl TreeSyncAdapter {
             tenant_deltas.prefix(),
             PREFIX,
             "TreeSyncAdapter requires a tenant-delta namespace scoped to `{PREFIX}`",
+        );
+        assert_eq!(
+            tree_paths.prefix(),
+            TREE_PATH_PREFIX,
+            "TreeSyncAdapter requires a tree-path namespace scoped to `{TREE_PATH_PREFIX}`",
         );
         assert_eq!(
             tree_repair_requests.prefix(),
@@ -545,6 +582,9 @@ impl TreeSyncAdapter {
         );
         Arc::new(Self {
             tenant_deltas,
+            tree_paths,
+            pending_paths: DashMap::new(),
+            cold_started: DashMap::new(),
             tree_repair_requests,
             tree_repair_pages,
             pending_deltas: DashMap::new(),
@@ -553,6 +593,7 @@ impl TreeSyncAdapter {
             outstanding_repairs: DashMap::new(),
             node_name,
             drain_handle: OnceLock::new(),
+            path_drain_handle: OnceLock::new(),
         })
     }
 
@@ -575,6 +616,27 @@ impl TreeSyncAdapter {
         assert!(
             self.drain_handle.set(handle).is_ok(),
             "TreeSyncAdapter::start called more than once",
+        );
+        let path_owner = Arc::downgrade(self);
+        let path_handle = self.tree_paths.register_drain(Box::new(move || {
+            path_owner
+                .upgrade()
+                .map(|this| this.drain_pending_paths())
+                .unwrap_or_default()
+        }));
+        assert!(
+            self.path_drain_handle.set(path_handle).is_ok(),
+            "TreeSyncAdapter::start called more than once",
+        );
+        self.subscribe(
+            &self.tree_paths,
+            TREE_PATH_PREFIX,
+            "tree-path",
+            |key| {
+                key.strip_prefix(TREE_PATH_PREFIX)
+                    .filter(|rest| !rest.is_empty())
+            },
+            |this, model_id, fragments| this.handle_incoming_paths(model_id, fragments),
         );
 
         self.subscribe(
@@ -702,6 +764,60 @@ impl TreeSyncAdapter {
             .entry(model_id.to_string())
             .or_default()
             .push(delta);
+    }
+
+    /// Buffer a local tree insert, with its path, for the next gossip round.
+    pub fn on_local_path_insert(&self, model_id: &str, delta: TreePathDelta) {
+        self.pending_paths
+            .entry(model_id.to_string())
+            .or_default()
+            .push(delta);
+    }
+
+    /// Collect each model's path buffer into one `tp:{model_id}` entry.
+    fn drain_pending_paths(&self) -> Vec<(String, Bytes)> {
+        let model_ids: Vec<String> = self
+            .pending_paths
+            .iter()
+            .filter(|e| !e.value().is_empty())
+            .map(|e| e.key().clone())
+            .collect();
+        let mut entries = Vec::with_capacity(model_ids.len());
+        for model_id in model_ids {
+            let Some((_, deltas)) = self.pending_paths.remove(&model_id) else {
+                continue;
+            };
+            if let Some(bytes) = encode(&deltas, |err| {
+                warn!(model_id, %err, "failed to serialize tree path deltas");
+            }) {
+                entries.push((format!("{TREE_PATH_PREFIX}{model_id}"), bytes));
+            }
+        }
+        entries
+    }
+
+    /// Insert each remote path as it stands. The first path delta for a
+    /// tree also asks a peer for its whole tree once: what it routed before
+    /// this node joined.
+    fn handle_incoming_paths(&self, model_id: &str, fragments: &[Bytes]) {
+        let Some(batch) = decode::<Vec<TreePathDelta>>(fragments, |err| {
+            warn!(model_id, %err, "failed to decode tree path batch");
+        }) else {
+            return;
+        };
+        for delta in &batch {
+            let kind = match delta.path {
+                TreePath::Text(_) => TreeKind::String,
+                TreePath::Tokens(_) => TreeKind::Token,
+            };
+            self.tree
+                .apply_remote_path(model_id, &delta.path, &delta.worker_url);
+            let key = (model_id.to_string(), kind);
+            if !self.cold_started.contains_key(&key) {
+                self.cold_started.insert(key, ());
+                self.request_repair_for_unknown_hash(model_id, kind, 0);
+            }
+        }
     }
 
     /// Test-only view onto the outbound buffer so integration tests

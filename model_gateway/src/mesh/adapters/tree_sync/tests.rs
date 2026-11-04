@@ -13,6 +13,16 @@ fn td_namespace(mesh: &MeshKV) -> Arc<StreamNamespace> {
     )
 }
 
+fn tp_namespace(mesh: &MeshKV) -> Arc<StreamNamespace> {
+    mesh.configure_stream_prefix(
+        TREE_PATH_PREFIX,
+        StreamConfig {
+            max_buffer_bytes: 64 * 1024,
+            routing: StreamRouting::Broadcast,
+        },
+    )
+}
+
 fn req_namespace(mesh: &MeshKV) -> Arc<StreamNamespace> {
     mesh.configure_stream_prefix(
         REPAIR_REQUEST_PREFIX,
@@ -166,7 +176,7 @@ fn adapter_over(
     let td = td_namespace(mesh);
     let req = req_namespace(mesh);
     let pages = page_namespace(mesh);
-    TreeSyncAdapter::new(td, req, pages, tree, peers, "node-a".into())
+    TreeSyncAdapter::new(td, tp_namespace(mesh), req, pages, tree, peers, "node-a".into())
 }
 
 fn adapter_with_empty_handle(mesh: &MeshKV) -> Arc<TreeSyncAdapter> {
@@ -394,7 +404,7 @@ async fn new_rejects_wrong_td_prefix() {
     );
     let tree: Arc<dyn TreeHandle> = empty_handle();
     let peers: Arc<dyn PeerList> = empty_peers();
-    let _ = TreeSyncAdapter::new(req_again, req, pages, tree, peers, "node-a".into());
+    let _ = TreeSyncAdapter::new(req_again, tp_namespace(&mesh), req, pages, tree, peers, "node-a".into());
 }
 
 #[tokio::test]
@@ -415,7 +425,7 @@ async fn new_rejects_wrong_repair_prefix() {
     );
     let tree: Arc<dyn TreeHandle> = empty_handle();
     let peers: Arc<dyn PeerList> = empty_peers();
-    let _ = TreeSyncAdapter::new(td, td_again, pages, tree, peers, "node-a".into());
+    let _ = TreeSyncAdapter::new(td, tp_namespace(&mesh), td_again, pages, tree, peers, "node-a".into());
 }
 
 #[tokio::test]
@@ -427,7 +437,7 @@ async fn new_rejects_empty_node_name() {
     let pages = page_namespace(&mesh);
     let tree: Arc<dyn TreeHandle> = empty_handle();
     let peers: Arc<dyn PeerList> = empty_peers();
-    let _ = TreeSyncAdapter::new(td, req, pages, tree, peers, String::new());
+    let _ = TreeSyncAdapter::new(td, tp_namespace(&mesh), req, pages, tree, peers, String::new());
 }
 
 #[tokio::test]
@@ -1110,7 +1120,7 @@ async fn new_rejects_wrong_pages_prefix() {
     );
     let tree: Arc<dyn TreeHandle> = empty_handle();
     let peers: Arc<dyn PeerList> = empty_peers();
-    let _ = TreeSyncAdapter::new(td, req, req_again, tree, peers, "node-a".into());
+    let _ = TreeSyncAdapter::new(td, tp_namespace(&mesh), req, req_again, tree, peers, "node-a".into());
 }
 
 // ----- d-2c: receiver side of the repair protocol -----
